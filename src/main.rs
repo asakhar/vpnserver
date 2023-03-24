@@ -5,6 +5,10 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
+// mod context;
+// mod handshake;
+mod sized_read_writes;
+
 #[tokio::main]
 async fn main() {
   let args = Cli::parse();
@@ -24,6 +28,7 @@ async fn main() {
   };
   let sk: &'static _ = Box::leak(Box::new(sk));
   let pk: &'static _ = Box::leak(Box::new(pk));
+
   let listener = TcpListener::bind(&args.bind_address)
     .await
     .expect("Failed to bind to address");
@@ -54,9 +59,9 @@ async fn handle_client(
     return;
   }
   let shared_secret = rmce::ShareableSecret::from(shared_secret_buf);
-  let plain_secret = shared_secret.open(sk);
-  let key = plain_secret.as_bytes();
   let cipher = openssl::symm::Cipher::aes_256_cbc();
+  let plain_secret = shared_secret.open(cipher.key_len(), sk);
+  let key = plain_secret.as_bytes();
   let data = b"Some Crypto Text";
   let mut iv = vec![0u8; cipher.iv_len().unwrap()];
   openssl::rand::rand_bytes(&mut iv).unwrap();
