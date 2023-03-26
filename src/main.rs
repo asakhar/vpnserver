@@ -38,7 +38,7 @@ fn main() {
 fn handle_client(stream: TcpStream, addr: SocketAddr, context: &PqsContext, dhcp: Arc<Dhcp>) {
   println!("Connection from: {addr}");
   stream
-    .set_read_timeout(Some(std::time::Duration::from_millis(1000)))
+    .set_read_timeout(Some(std::time::Duration::from_millis(3000)))
     .unwrap();
   let mut stream = match PqsChannel::new(stream, context) {
     Ok(res) => res,
@@ -47,6 +47,9 @@ fn handle_client(stream: TcpStream, addr: SocketAddr, context: &PqsContext, dhcp
       return;
     }
   };
+  stream
+    .set_read_timeout(Some(std::time::Duration::from_millis(500)))
+    .unwrap();
   let (client_ip, receiver) = dhcp.new_client().unwrap();
   stream.write_all(&client_ip).unwrap();
   loop {
@@ -88,9 +91,9 @@ fn parse_packet(data: &[u8]) -> Option<[u8; 4]> {
       println!("packet header: {header:?}");
       return Some(header.destination);
     }
-    etherparse::InternetSlice::Ipv6(header, _exts) => {
-      let header = header.to_header();
-      println!("packet header: {header:?}");
+    etherparse::InternetSlice::Ipv6(_header, _exts) => {
+      // let header = header.to_header();
+      // println!("packet header: {header:?}");
     }
   }
   None
