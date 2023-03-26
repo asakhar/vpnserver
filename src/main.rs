@@ -77,42 +77,6 @@ fn handle_client(stream: TcpStream, addr: SocketAddr, context: &PqsContext, dhcp
     };
   }
   dhcp.free(client_ip).unwrap();
-  // let mut bytes = [0u8; 20];
-  // //Write IPV4 version and header length
-  // bytes[0] = 0x40;
-
-  // //Finish writing IP header
-  // bytes[9] = 0x69;
-  // bytes[10] = 0x04;
-  // bytes[11] = 0x20;
-  // //...
-  // stream.write_sized(bytes).unwrap();
-  // loop {
-  //   match stream.read_sized() {
-  //     Ok(packet_data) => {
-  //       let packet = etherparse::SlicedPacket::from_ip(&packet_data).unwrap();
-  //       let ip = packet.ip.unwrap();
-  //       match ip {
-  //         etherparse::InternetSlice::Ipv4(header, exts) => {
-  //           let header = header.to_header();
-  //           println!("packet header: {header:?}");
-  //         }
-  //         etherparse::InternetSlice::Ipv6(header, exts) => {
-  //           let header = header.to_header();
-  //           println!("packet header: {header:?}");
-  //         }
-  //       }
-  //     }
-  //     Err(err) => {
-  //       if !matches!(
-  //         err.kind(),
-  //         std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-  //       ) {
-  //         panic!("Error: {err:?}");
-  //       }
-  //     }
-  //   }
-  // }
 }
 
 fn parse_packet(data: &[u8]) -> Option<[u8; 4]> {
@@ -132,16 +96,6 @@ fn parse_packet(data: &[u8]) -> Option<[u8; 4]> {
   None
 }
 
-// let mut buf = [0u8; std::mem::size_of::<usize>()];
-// stream.read_exact(&mut buf).unwrap();
-// let len = usize::from_be_bytes(buf);
-// let mut line = vec![0u8; len];
-// stream.read_exact(&mut line).unwrap();
-// println!("-> {}", String::from_utf8(line).unwrap());
-// let mut line = String::new();
-// std::io::stdin().read_line(&mut line).unwrap();
-// stream.write_all(&line.len().to_be_bytes()).unwrap();
-// stream.write_all(line.as_bytes()).unwrap();
 #[derive(clap::Parser)]
 struct Cli {
   #[arg(short, long, default_value_t = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 9011)))]
