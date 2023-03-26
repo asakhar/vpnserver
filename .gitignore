@@ -1,3 +1,7 @@
 /target
 server.key
 server.cert
+server.pub
+ca.cert
+ca.key
+ca.pub
