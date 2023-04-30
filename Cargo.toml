@@ -8,8 +8,10 @@ edition = "2021"
 [dependencies]
 clap = { version = "4.1.3", features = ["derive"] }
 etherparse = "0.13.0"
+log = "0.4.17"
 openssl = "0.10.48"
 qprov = { version = "0.1.0", path = "../qprov" }
+transient-hashmap = "0.4.1"
 
 [profile.dev.package."rmce"]
 opt-level = 2

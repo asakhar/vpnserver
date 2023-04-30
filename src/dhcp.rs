@@ -1,80 +1,120 @@
 use std::{
-  collections::{BTreeMap, BinaryHeap},
+  collections::BinaryHeap,
   io::ErrorKind,
-  sync::{mpsc, Mutex},
+  net::Ipv4Addr,
+  time::Duration,
 };
 
-pub struct Dhcp {
-  base: u32,
-  next: Mutex<BinaryHeap<u8>>,
-  clients: Mutex<BTreeMap<u32, mpsc::Sender<Vec<u8>>>>,
+use log::debug;
+
+use transient_hashmap::TransientHashMap;
+
+pub trait ClientRequest<Client> {
+  fn into_client(ip: Ipv4Addr) -> Client;
 }
 
-impl Default for Dhcp {
-  fn default() -> Self {
-    let mut next = BinaryHeap::new();
-    next.extend(2..253);
+pub struct Dhcp<Client> {
+  net_addr: u32,
+  net_mask: u32,
+  vacant: BinaryHeap<std::cmp::Reverse<u32>>,
+  clients: TransientHashMap<u32, Client>,
+}
+
+impl<Client> Dhcp<Client> {
+  pub fn new(net_addr: Ipv4Addr, net_mask_suffix: u8, client_data_lifetime: Duration) -> Self {
+    assert!(net_mask_suffix < 31, "Invalid network mask");
+    let net_addr = u32::from_be_bytes(net_addr.octets());
+    let unit_mask = (1 << net_mask_suffix) - 1;
+    let net_mask = !unit_mask;
+    assert_eq!(
+      net_addr & unit_mask,
+      0,
+      "Invalid network address {net_addr}/{net_mask_suffix}"
+    );
+    let lifetime_sec = client_data_lifetime.as_secs();
+    assert!(lifetime_sec <= u32::MAX as u64, "Too long lifetime");
+    let mut vacant = Default::default();
+    let last = net_addr | (unit_mask - 2);
+    let first = net_addr | 2;
+    let ips = std::cmp::Reverse(last)..=std::cmp::Reverse(first);
+    vacant.extend(ips);
     Self {
-      base: (10 << 24) | (10 << 16) | (10 << 8) | (0 << 0),
-      next: Mutex::new(next),
-      clients: Default::default(),
+      net_addr,
+      net_mask,
+      vacant,
+      clients: TransientHashMap::new(client_data_lifetime.as_secs().into()),
     }
   }
 }
 
-impl Dhcp {
-  pub fn new_client(&self) -> std::io::Result<([u8; 4], mpsc::Receiver<Vec<u8>>)> {
-    let next_id = self.next.lock().unwrap().pop();
-    let id = 255
-      - next_id.ok_or(std::io::Error::new(
+impl<Client> Default for Dhcp<Client> {
+  fn default() -> Self {
+    Self::new(Ipv4Addr::new(10, 10, 10, 0), 24, Duration::from_secs(60))
+  }
+}
+
+impl<Client> Dhcp<Client> {
+  pub fn new_client(&mut self, request: impl ClientRequest<Client>) -> std::io::Result<Ipv4Addr> {
+    let next_ip = self
+      .vacant
+      .pop()
+      .ok_or(std::io::Error::new(
         ErrorKind::Other,
         "Too many devices on the network",
-      ))?;
-    let ip = self.base | id as u32;
-    let ip_bytes = ip.to_be_bytes();
-    let (tx, rx) = mpsc::channel();
-    drop(self.clients.lock().unwrap().insert(ip, tx));
-    println!("hand out ip: {:?}", ip_bytes);
-    Ok((ip_bytes, rx))
+      ))?
+      .0;
+    let ip = Ipv4Addr::from(next_ip.to_be_bytes());
+    self.clients.insert(ip, request.into_client(ip));
+    debug!("hand out ip: {:?}", ip);
+    Ok(ip)
   }
-  pub fn free(&self, ip: [u8; 4]) -> std::io::Result<()> {
-    println!("returned ip: {:?}", ip);
-    let ip = u32::from_be_bytes(ip);
-    if ip & 0xffffff00 != self.base {
+  pub fn prune(&mut self) {
+    self.vacant.extend(self.clients.prune())
+  }
+  pub fn free(&mut self, ip: Ipv4Addr) -> std::io::Result<()> {
+    debug!("returned ip: {:?}", ip);
+    let ip = u32::from_be_bytes(ip.octets());
+    if ip & self.net_mask != self.net_addr {
       return Err(std::io::Error::new(
         ErrorKind::InvalidInput,
-        "Invalid ip address",
+        "Ip address does not belong to this pool",
       ));
     }
-    self
-      .clients
-      .lock()
-      .unwrap()
-      .remove(&ip)
-      .ok_or(std::io::Error::new(
-        ErrorKind::NotFound,
-        "Device does not exist in pool",
-      ))?;
-    let id = (ip & 0xff) as u8;
-    self.next.lock().unwrap().push(255 - id);
-    Ok(())
-  }
-  pub fn send(&self, ip: [u8; 4], packet: Vec<u8>) -> std::io::Result<()> {
-    let ip = u32::from_be_bytes(ip);
-    if ip & 0xffffff00 != self.base {
-      return Err(std::io::Error::new(
-        ErrorKind::InvalidInput,
-        "Invalid ip address",
-      ));
-    }
-    let clients = self.clients.lock().unwrap();
-    let sender = clients.get(&ip).ok_or(std::io::Error::new(
+    self.clients.remove(&ip).ok_or(std::io::Error::new(
       ErrorKind::NotFound,
       "Device does not exist in pool",
     ))?;
-    sender
-      .send(packet)
-      .map_err(|err| std::io::Error::new(ErrorKind::ConnectionRefused, err))?;
+    self.vacant.push(std::cmp::Reverse(ip));
     Ok(())
+  }
+  pub fn get(&self, ip: Ipv4Addr) -> std::io::Result<&Client> {
+    let ip = u32::from_be_bytes(ip.octets());
+    if ip & self.net_mask != self.net_addr {
+      return Err(std::io::Error::new(
+        ErrorKind::InvalidInput,
+        "Ip address does not belong to this pool",
+      ));
+    }
+    Ok(
+      self
+        .clients
+        .get(&ip)
+        .ok_or(std::io::Error::new(ErrorKind::NotFound, "Client not found"))?,
+    )
+  }
+  pub fn get_mut(&mut self, ip: Ipv4Addr) -> std::io::Result<&mut Client> {
+    let ip = u32::from_be_bytes(ip.octets());
+    if ip & self.net_mask != self.net_addr {
+      return Err(std::io::Error::new(
+        ErrorKind::InvalidInput,
+        "Ip address does not belong to this pool",
+      ));
+    }
+    Ok(
+      self
+        .clients
+        .get_mut(&ip)
+        .ok_or(std::io::Error::new(ErrorKind::NotFound, "Client not found"))?,
+    )
   }
 }
