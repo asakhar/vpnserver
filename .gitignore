@@ -5,3 +5,4 @@ server.pub
 ca.cert
 ca.key
 ca.pub
+Cargo.lock
