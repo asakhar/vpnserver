@@ -1,80 +1,136 @@
 use std::{
-  collections::{BTreeMap, BinaryHeap},
+  collections::{BinaryHeap, HashMap},
   io::ErrorKind,
-  sync::{mpsc, Mutex},
+  net::Ipv4Addr,
 };
 
+use log::debug;
+
 pub struct Dhcp {
-  base: u32,
-  next: Mutex<BinaryHeap<u8>>,
-  clients: Mutex<BTreeMap<u32, mpsc::Sender<Vec<u8>>>>,
+  vacant: BinaryHeap<std::cmp::Reverse<u32>>,
+  clients: HashMap<u32, uuid::Uuid>,
+}
+
+impl Dhcp {
+  pub fn new(net_addr: Ipv4Addr, net_mask_suffix: u8) -> Self {
+    assert!(net_mask_suffix < 31, "Invalid network mask");
+    let net_addr_int = u32::from_be_bytes(net_addr.octets());
+    let unit_mask = (1 << (32-net_mask_suffix)) - 1;
+    assert_eq!(
+      net_addr_int & unit_mask,
+      0,
+      "Invalid network address {net_addr_int:032b}/{net_mask_suffix} ({:?}/{net_mask_suffix})", net_addr.octets()
+    );
+    let mut vacant: BinaryHeap<_> = Default::default();
+    let last = net_addr_int | (unit_mask - 2);
+    let first = net_addr_int | 2;
+    let ips = first..=last;
+    vacant.extend(ips.map(std::cmp::Reverse));
+    Self {
+      vacant,
+      clients: HashMap::new(),
+    }
+  }
 }
 
 impl Default for Dhcp {
   fn default() -> Self {
-    let mut next = BinaryHeap::new();
-    next.extend(2..253);
-    Self {
-      base: (10 << 24) | (10 << 16) | (10 << 8) | (0 << 0),
-      next: Mutex::new(next),
-      clients: Default::default(),
-    }
+    Self::new(Ipv4Addr::new(10, 10, 10, 0), 24)
   }
 }
 
 impl Dhcp {
-  pub fn new_client(&self) -> std::io::Result<([u8; 4], mpsc::Receiver<Vec<u8>>)> {
-    let next_id = self.next.lock().unwrap().pop();
-    let id = 255
-      - next_id.ok_or(std::io::Error::new(
+  pub fn new_client(&mut self, id: uuid::Uuid) -> std::io::Result<Ipv4Addr> {
+    let next_ip = self
+      .vacant
+      .pop()
+      .ok_or(std::io::Error::new(
         ErrorKind::Other,
         "Too many devices on the network",
-      ))?;
-    let ip = self.base | id as u32;
-    let ip_bytes = ip.to_be_bytes();
-    let (tx, rx) = mpsc::channel();
-    drop(self.clients.lock().unwrap().insert(ip, tx));
-    println!("hand out ip: {:?}", ip_bytes);
-    Ok((ip_bytes, rx))
+      ))?
+      .0;
+    let ip = Ipv4Addr::from(next_ip.to_be_bytes());
+    self.clients.insert(next_ip, id);
+    debug!("hand out ip: {:?}", ip);
+    Ok(ip)
   }
-  pub fn free(&self, ip: [u8; 4]) -> std::io::Result<()> {
-    println!("returned ip: {:?}", ip);
-    let ip = u32::from_be_bytes(ip);
-    if ip & 0xffffff00 != self.base {
-      return Err(std::io::Error::new(
-        ErrorKind::InvalidInput,
-        "Invalid ip address",
-      ));
-    }
-    self
-      .clients
-      .lock()
-      .unwrap()
-      .remove(&ip)
-      .ok_or(std::io::Error::new(
-        ErrorKind::NotFound,
-        "Device does not exist in pool",
-      ))?;
-    let id = (ip & 0xff) as u8;
-    self.next.lock().unwrap().push(255 - id);
-    Ok(())
-  }
-  pub fn send(&self, ip: [u8; 4], packet: Vec<u8>) -> std::io::Result<()> {
-    let ip = u32::from_be_bytes(ip);
-    if ip & 0xffffff00 != self.base {
-      return Err(std::io::Error::new(
-        ErrorKind::InvalidInput,
-        "Invalid ip address",
-      ));
-    }
-    let clients = self.clients.lock().unwrap();
-    let sender = clients.get(&ip).ok_or(std::io::Error::new(
+  pub fn free(&mut self, ip: Ipv4Addr) -> std::io::Result<()> {
+    debug!("returned ip: {:?}", ip);
+    let ip = u32::from_be_bytes(ip.octets());
+    self.clients.remove(&ip).ok_or(std::io::Error::new(
       ErrorKind::NotFound,
       "Device does not exist in pool",
     ))?;
-    sender
-      .send(packet)
-      .map_err(|err| std::io::Error::new(ErrorKind::ConnectionRefused, err))?;
+    self.vacant.push(std::cmp::Reverse(ip));
     Ok(())
+  }
+  pub fn get(&self, ip: Ipv4Addr) -> std::io::Result<uuid::Uuid> {
+    let ip = u32::from_be_bytes(ip.octets());
+    Ok(
+      self
+        .clients
+        .get(&ip)
+        .copied()
+        .ok_or(std::io::Error::new(ErrorKind::NotFound, "Client not found"))?,
+    )
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use std::net::Ipv4Addr;
+
+  use uuid::Uuid;
+
+  use super::Dhcp;
+
+  #[test]
+  fn default_gives_right_addresses() {
+    let mut dhcp = Dhcp::default();
+
+    let ids: Vec<_> = (2..254).map(|i| (i, Uuid::new_v4())).collect();
+    for (i, id) in ids.iter() {
+      assert_eq!(
+        dhcp.new_client(*id).unwrap(),
+        Ipv4Addr::new(10, 10, 10, *i)
+      );
+    }
+    for (i, id) in ids {
+      assert_eq!(
+        dhcp.get(Ipv4Addr::new(10, 10, 10, i)).unwrap(), id
+      )
+    }
+    dhcp.new_client(Uuid::new_v4()).unwrap_err();
+  }
+  #[test]
+  fn test_new() {
+    let mut dhcp = Dhcp::new(Ipv4Addr::new(192, 168, 128, 0), 17);
+    let ids: Vec<_> = (2u32..0b111111111111110).map(|i| (i, Uuid::new_v4())).collect();
+    for (i, id) in ids {
+      let low = i%256;
+      let high = i/256;
+      assert_eq!(
+        dhcp.new_client(id).unwrap(),
+        Ipv4Addr::new(192, 168, 128|high as u8, low as u8)
+      );
+    }
+    dhcp.new_client(Uuid::new_v4()).unwrap_err();
+  }
+  #[test]
+  fn test_free() {
+    let mut dhcp = Dhcp::default();
+
+    let ids: Vec<_> = (2..20).map(|i| (i, Uuid::new_v4())).collect();
+    for (i, id) in ids.iter() {
+      assert_eq!(
+        dhcp.new_client(*id).unwrap(),
+        Ipv4Addr::new(10, 10, 10, *i)
+      );
+    }
+    dhcp.free(Ipv4Addr::new(10, 10, 10, 2)).unwrap();
+    assert_eq!(
+      dhcp.new_client(ids.first().unwrap().1).unwrap(),
+      Ipv4Addr::new(10, 10, 10, 2)
+    );
   }
 }
