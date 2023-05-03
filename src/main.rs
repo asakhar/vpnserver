@@ -172,7 +172,9 @@ impl AppState {
     let Some(message) = result_add else {
       return Ok(());
     };
-    send_fin_to(&mut self.socket, addr, id, self.buffer.as_mut_slice())?;
+    if requires_ack {
+      send_fin_to(&mut self.socket, addr, id, self.buffer.as_mut_slice())?;
+    }
     drop(self.messages.remove(&IdPair(addr, id)));
     match message {
       PlainMessage::Hello(client_hello) => {
@@ -209,7 +211,8 @@ impl AppState {
         let message = PlainMessage::Premaster(encapsulated);
         send_guaranteed_to(&mut self.socket, addr, message, self.buffer.as_mut_slice())?;
 
-        let derived_key = client_hello.random ^ server_hello.random ^ server_premaster ^ client_premaster;
+        let derived_key =
+          client_hello.random ^ server_hello.random ^ server_premaster ^ client_premaster;
 
         let server_hello = server_hello.random;
         drop(std::mem::replace(
@@ -253,8 +256,12 @@ impl AppState {
           socket_addr: addr,
           vpn_ip: ip,
         });
-        
-        let encrypted = DecryptedMessage::Welcome { ip, mask: self.dhcp.get_net_mask_suffix() }.encrypt(&mut client.crypter);
+
+        let encrypted = DecryptedMessage::Welcome {
+          ip,
+          mask: self.dhcp.get_net_mask_suffix(),
+        }
+        .encrypt(&mut client.crypter);
 
         send_guaranteed_to(
           &mut self.socket,
@@ -282,6 +289,9 @@ impl AppState {
           ErrorKind::InvalidInput,
           "Failed to get recipent from packet",
         ))?;
+        if self.dhcp.is_broadcast(destination) {
+          println!("Received broadcast from: {addr}");
+        }
         let recipent = self
           .clients_map
           .get_mut(&self.dhcp.get(destination)?)
@@ -317,7 +327,7 @@ fn parse_packet(data: &[u8]) -> Option<Ipv4Addr> {
   match ip {
     etherparse::InternetSlice::Ipv4(header, _exts) => {
       let header = header.to_header();
-      println!("packet header: {header:?}");
+      // println!("packet header: {header:?}");
       return Some(Ipv4Addr::from(header.destination));
     }
     etherparse::InternetSlice::Ipv6(_header, _exts) => {

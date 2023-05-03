@@ -80,6 +80,11 @@ impl Dhcp {
         .ok_or(std::io::Error::new(ErrorKind::NotFound, "Client not found"))?,
     )
   }
+  pub fn is_broadcast(&self, ip: Ipv4Addr) -> bool {
+    let ip = u32::from_be_bytes(ip.octets());
+    let unit_mask = (1 << (32 - self.net_mask_suffix)) - 1;
+    (ip & unit_mask).count_ones() == unit_mask.count_ones()
+  }
 }
 
 #[cfg(test)]
