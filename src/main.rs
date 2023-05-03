@@ -455,7 +455,7 @@ struct Cli {
   bind_address: SocketAddr,
   #[arg(short, long, default_value_t = ("server.key".to_owned()))]
   secret_key_file: String,
-  #[arg(short, long, default_value_t = ("server.cert".to_owned()))]
+  #[arg(short, long, default_value_t = ("server.crt".to_owned()))]
   certificate_file: String,
   #[arg(short, long, default_value_t = ("ca.cert".to_owned()))]
   ca_cert_file: String,
