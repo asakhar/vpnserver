@@ -19,5 +19,5 @@ qprov = { version = "0.1.0", path = "../qprov" }
 serde = { version = "1.0.160", features = ["derive"] }
 uuid = { version = "1.3.2", features = ["v4"] }
 
-[profile.dev.package."rmce"]
+[profile.dev.package."*"]
 opt-level = 3
