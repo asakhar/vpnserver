@@ -13,11 +13,11 @@ clap = { version = "4.1.3", features = ["derive"] }
 etherparse = "0.13.0"
 lazy_static = "1.4.0"
 log = "0.4.17"
-mio = { version = "0.8.6", features = ["net", "os-poll"] }
 openssl = "0.10.48"
 qprov = { version = "0.1.0", path = "../qprov" }
 serde = { version = "1.0.160", features = ["derive"] }
-uuid = { version = "1.3.2", features = ["v4"] }
+uuid = { version = "1.3.2", features = ["v4", "serde"] }
+vpnmessaging = { version = "0.1.0", path = "../vpnmessaging" }
 
 [profile.dev.package."*"]
 opt-level = 3

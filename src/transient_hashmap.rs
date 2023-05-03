@@ -31,6 +31,7 @@ impl Timer for StandardTimer {
 ///
 /// Pruning does not occur automatically, make sure to call `prune` method
 /// to remove old entries.
+#[derive(Debug, Clone)]
 pub struct TransientHashMap<K, V, T = StandardTimer> where T: Timer {
 	backing: HashMap<K, V>,
 	timestamps: HashMap<K, i128>,
