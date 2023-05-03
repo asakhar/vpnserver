@@ -254,7 +254,7 @@ impl AppState {
           vpn_ip: ip,
         });
         
-        let encrypted = DecryptedMessage::Welcome { ip }.encrypt(&mut client.crypter);
+        let encrypted = DecryptedMessage::Welcome { ip, mask: self.dhcp.get_net_mask_suffix() }.encrypt(&mut client.crypter);
 
         send_guaranteed_to(
           &mut self.socket,
