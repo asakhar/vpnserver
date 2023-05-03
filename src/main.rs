@@ -457,6 +457,6 @@ struct Cli {
   secret_key_file: String,
   #[arg(short, long, default_value_t = ("server.crt".to_owned()))]
   certificate_file: String,
-  #[arg(short, long, default_value_t = ("ca.cert".to_owned()))]
+  #[arg(short, long, default_value_t = ("ca.crt".to_owned()))]
   ca_cert_file: String,
 }
