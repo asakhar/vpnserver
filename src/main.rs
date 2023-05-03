@@ -39,7 +39,6 @@ enum PotentianClient {
     server_hello: HelloMessage,
   },
   AwaitReady {
-    hash: KeyType,
     server_hello: KeyType,
     derived_key: KeyType,
   },
@@ -175,7 +174,6 @@ impl AppState {
     };
     send_fin_to(&mut self.socket, addr, id, self.buffer.as_mut_slice())?;
     drop(self.messages.remove(&IdPair(addr, id)));
-    println!("Received complete message");
     match message {
       PlainMessage::Hello(client_hello) => {
         if !client_hello.chain.verify(&self.ca, certificate_verificator) {
@@ -205,29 +203,21 @@ impl AppState {
         let PotentianClient::AwaitPremaster { client_hello, server_hello } = potential else {
           return Err(Box::new(std::io::Error::new(ErrorKind::InvalidInput, "Invalid input for state await premaster")));
         };
-        let premaster = KeyType::decapsulate(&self.sk, &encapsulated);
-        let derived_key = client_hello.random ^ server_hello.random ^ premaster;
+        let server_premaster = KeyType::decapsulate(&self.sk, &encapsulated);
+        let (encapsulated, client_premaster) =
+          KeyType::encapsulate(&client_hello.chain.get_target().contents.pub_keys);
+        let message = PlainMessage::Premaster(encapsulated);
+        send_guaranteed_to(&mut self.socket, addr, message, self.buffer.as_mut_slice())?;
 
-        let hash = KeyType::zero(); // TODO: compute hashes
-
-        let mut crypter = ClientCrypter::new(derived_key, iv_from_hello(client_hello.random));
-        let encrypted = DecryptedMessage::Ready { hash }.encrypt(&mut crypter);
-
-        send_guaranteed_to(
-          &mut self.socket,
-          addr,
-          encrypted,
-          self.buffer.as_mut_slice(),
-        )?;
+        let derived_key = client_hello.random ^ server_hello.random ^ server_premaster ^ client_premaster;
 
         let server_hello = server_hello.random;
         drop(std::mem::replace(
           potential,
           PotentianClient::AwaitReady {
-            hash,
             server_hello,
             derived_key,
-          }, // TODO: save different hash
+          },
         ));
       }
       PlainMessage::Ready(data) => {
@@ -235,7 +225,7 @@ impl AppState {
           ErrorKind::NotFound,
           "Potential client not found",
         ))?;
-        let PotentianClient::AwaitReady { hash: expected_hash, server_hello, derived_key } = potential else {
+        let PotentianClient::AwaitReady { server_hello, derived_key } = potential else {
           return Err(Box::new(std::io::Error::new(ErrorKind::InvalidInput, "Invalid input for state await ready")));
         };
         let mut crypter = ClientCrypter::new(derived_key, iv_from_hello(server_hello));
@@ -246,6 +236,7 @@ impl AppState {
         let DecryptedMessage::Ready { hash } = data else {
           return Err(Box::new(std::io::Error::new(ErrorKind::InvalidInput, "Invalid input for state await ready")));
         };
+        let expected_hash = KeyType::zero(); // TODO: compute hash
         if !compare_hashes(expected_hash, hash) {
           return Err(Box::new(std::io::Error::new(
             ErrorKind::InvalidInput,
@@ -262,6 +253,7 @@ impl AppState {
           socket_addr: addr,
           vpn_ip: ip,
         });
+        
         let encrypted = DecryptedMessage::Welcome { ip }.encrypt(&mut client.crypter);
 
         send_guaranteed_to(
