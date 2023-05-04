@@ -221,6 +221,7 @@ impl AppState {
     if requires_ack {
       send_fin_to(&mut self.socket, addr, id, self.buffer.as_mut_slice())?;
     }
+    println!("received full message: {id}");
     drop(self.messages.remove(&IdPair(addr, id)));
     match message {
       PlainMessage::Hello(client_hello) => {
@@ -236,7 +237,13 @@ impl AppState {
           random,
         };
         let message = PlainMessage::Hello(server_hello.clone());
-        send_guaranteed_to(&mut self.socket, addr, message, self.buffer.as_mut_slice())?;
+        send_guaranteed_to(
+          &mut self.socket,
+          addr,
+          message,
+          self.buffer.as_mut_slice(),
+          Some(Duration::from_millis(500)),
+        )?;
         let potential = PotentianClient::AwaitPremaster {
           client_hello,
           server_hello,
@@ -255,7 +262,13 @@ impl AppState {
         let (encapsulated, client_premaster) =
           KeyType::encapsulate(&client_hello.chain.get_target().contents.pub_keys);
         let message = PlainMessage::Premaster(encapsulated);
-        send_guaranteed_to(&mut self.socket, addr, message, self.buffer.as_mut_slice())?;
+        send_guaranteed_to(
+          &mut self.socket,
+          addr,
+          message,
+          self.buffer.as_mut_slice(),
+          Some(Duration::from_millis(500)),
+        )?;
 
         let derived_key =
           client_hello.random ^ server_hello.random ^ server_premaster ^ client_premaster;
@@ -317,6 +330,7 @@ impl AppState {
           addr,
           encrypted,
           self.buffer.as_mut_slice(),
+          Some(Duration::from_millis(500)),
         )?;
       }
       PlainMessage::Encrypted(data) => {
@@ -328,6 +342,7 @@ impl AppState {
             ErrorKind::NotFound,
             format!("Client not found: {}", addr),
           ))?;
+        println!("received encrytped");
         let decrypted = data
           .decrypt(&mut client.crypter)
           .ok_or(std::io::Error::new(
