@@ -1,6 +1,7 @@
 #![allow(unused_parens)]
 use clap::Parser;
 use dhcp::Dhcp;
+use vpnmessaging::qprov;
 use qprov::Certificate;
 use std::collections::HashMap;
 use std::fs::File;
