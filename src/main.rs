@@ -417,10 +417,10 @@ fn parse_packet(data: &[u8]) -> Option<(Ipv4Addr, Ipv4Addr)> {
 struct Cli {
   #[arg(short, long, default_value_t = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 9011)))]
   bind_address: SocketAddr,
-  #[arg(short, long, default_value_t = ("server.key".to_owned()))]
+  #[arg(short, long, default_value_t = ("keys/server.key".to_owned()))]
   secret_key_file: String,
-  #[arg(short = 'e', long, default_value_t = ("server.chn".to_owned()))]
+  #[arg(short = 'e', long, default_value_t = ("keys/server.chn".to_owned()))]
   certificate_chain_file: String,
-  #[arg(short, long, default_value_t = ("ca.crt".to_owned()))]
+  #[arg(short, long, default_value_t = ("keys/ca.crt".to_owned()))]
   ca_cert_file: String,
 }

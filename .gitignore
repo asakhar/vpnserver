@@ -1,5 +1,4 @@
 /target
-server.*
-ca.*
+keys
 Cargo.lock
 wintun.dll
