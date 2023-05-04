@@ -1,7 +1,6 @@
 #![allow(unused_parens)]
 use clap::Parser;
 use dhcp::Dhcp;
-use vpnmessaging::qprov;
 use qprov::Certificate;
 use std::collections::HashMap;
 use std::fs::File;
@@ -11,6 +10,7 @@ use std::time::Duration;
 use transient_hashmap::TransientHashMap;
 use uuid::Uuid;
 use vpnmessaging::mio::net::UdpSocket;
+use vpnmessaging::qprov;
 use vpnmessaging::{
   compare_hashes, iv_from_hello, send_ack_to, send_guaranteed_to, send_unreliable_to,
   ClientCrypter, DecryptedMessage, HelloMessage, IdPair, KeyType, MessagePartsCollection,
@@ -104,9 +104,9 @@ impl App {
 
     let buffer: Box<[u8; BUF_SIZE]> = boxed_array::from_default();
 
-    let clients = TransientHashMap::new(Duration::from_secs(60 * 60));
+    let clients = TransientHashMap::new(Duration::from_secs(20));
     let clients_map = Default::default();
-    let messages = TransientHashMap::new(Duration::from_secs(60 * 60));
+    let messages = TransientHashMap::new(Duration::from_secs(20));
     let tun_sender = tun.sender();
     Self {
       events,
@@ -140,6 +140,9 @@ impl App {
     for (IdPair(addr, id), _) in self.state.messages.prune() {
       println!("Pruned {}:{}", addr, id);
     }
+    for (potential, _) in self.state.potential.prune() {
+      println!("Pruned potential client {}", potential);
+    }
     self.state.poll.poll(&mut self.events, None).unwrap();
 
     for event in &self.events {
@@ -171,9 +174,8 @@ impl App {
 
 impl AppState {
   pub fn handle_tun_event(&mut self, packet: Vec<u8>) -> Result<(), Box<dyn std::error::Error>> {
-    let Some((source, destination)) = parse_packet(&packet) else {return Ok(())};
+    let Some((_, destination)) = parse_packet(&packet) else {return Ok(())};
     if self.dhcp.is_broadcast(destination) {
-      println!("Received broadcast from: {source}");
       return Ok(());
     }
     let Some(recipent) = self
@@ -222,7 +224,6 @@ impl AppState {
     if requires_ack {
       send_fin_to(&mut self.socket, addr, id, self.buffer.as_mut_slice())?;
     }
-    println!("received full message: {id}");
     drop(self.messages.remove(&IdPair(addr, id)));
     match message {
       PlainMessage::Hello(client_hello) => {
@@ -243,7 +244,7 @@ impl AppState {
           addr,
           message,
           self.buffer.as_mut_slice(),
-          Some(Duration::from_millis(500)),
+          Some(Duration::from_millis(2000)),
         )?;
         let potential = PotentianClient::AwaitPremaster {
           client_hello,
@@ -343,42 +344,20 @@ impl AppState {
             ErrorKind::NotFound,
             format!("Client not found: {}", addr),
           ))?;
-        println!("received encrytped");
         let decrypted = data
           .decrypt(&mut client.crypter)
           .ok_or(std::io::Error::new(
             ErrorKind::InvalidInput,
             "Failed to decrypt message",
           ))?;
+        if matches!(decrypted, DecryptedMessage::KeepAlive) {
+          let encrypted = decrypted.encrypt(&mut client.crypter);
+          return Ok(send_unreliable_to(&self.socket, addr, encrypted, self.buffer.as_mut_slice())?);
+        }
         let DecryptedMessage::IpPacket(data) = decrypted else {
           return Err(Box::new(std::io::Error::new(ErrorKind::InvalidInput, "Invalid input for state registered client")));
         };
         self.tun_sender.send(data);
-        // let destination = parse_packet(data).ok_or(std::io::Error::new(
-        //   ErrorKind::InvalidInput,
-        //   "Failed to get recipent from packet",
-        // ))?;
-        // if self.dhcp.is_broadcast(destination) {
-        //   println!("Received broadcast from: {addr}");
-        //   return Ok(());
-        // }
-        // let recipent = self.dhcp.get(destination).and_then(|recipent_id| {
-        //   self
-        //     .clients_map
-        //     .get_mut(&recipent_id)
-        //     .ok_or(std::io::Error::new(
-        //       ErrorKind::NotFound,
-        //       format!("Recipent not found in pool: {destination}"),
-        //     ))
-        // })?;
-        // let encrypted = decrypted.encrypt(&mut recipent.crypter);
-
-        // send_unreliable_to(
-        //   &mut self.socket,
-        //   recipent.socket_addr,
-        //   encrypted,
-        //   self.buffer.as_mut_slice(),
-        // )?;
       }
     }
     Ok(())
@@ -399,18 +378,13 @@ fn parse_packet(data: &[u8]) -> Option<(Ipv4Addr, Ipv4Addr)> {
   match ip {
     etherparse::InternetSlice::Ipv4(header, _exts) => {
       let header = header.to_header();
-      // println!("packet header: {header:?}");
-      return Some((
+      Some((
         Ipv4Addr::from(header.source),
         Ipv4Addr::from(header.destination),
-      ));
+      ))
     }
-    etherparse::InternetSlice::Ipv6(_header, _exts) => {
-      // let header = header.to_header();
-      // println!("packet header: {header:?}");
-    }
+    _ => None,
   }
-  None
 }
 
 #[derive(clap::Parser)]
