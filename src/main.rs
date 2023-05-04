@@ -78,7 +78,7 @@ impl App {
 
     let mut socket = UdpSocket::bind(args.bind_address).expect("Failed to bind to address");
     let dhcp = Dhcp::default();
-    let potential = TransientHashMap::new(Duration::from_millis(100));
+    let potential = TransientHashMap::new(Duration::from_millis(1000));
     let poll = mio::Poll::new().unwrap();
     let registry = poll.registry();
     registry
@@ -88,9 +88,9 @@ impl App {
 
     let buffer: Box<[u8; 0xffff]> = boxed_array::from_default();
 
-    let clients = TransientHashMap::new(Duration::from_secs(1));
+    let clients = TransientHashMap::new(Duration::from_secs(60 * 60));
     let clients_map = Default::default();
-    let messages = TransientHashMap::new(Duration::from_millis(1000));
+    let messages = TransientHashMap::new(Duration::from_secs(60 * 60));
     Self {
       events,
       state: AppState {
@@ -109,7 +109,8 @@ impl App {
     }
   }
   pub fn run(&mut self) {
-    for (_, client) in self.state.clients.prune() {
+    for (addr, client) in self.state.clients.prune() {
+      println!("Pruned client: {addr}");
       let client = self.state.clients_map.remove(&client).unwrap();
       self
         .state
@@ -131,6 +132,7 @@ impl App {
               if matches!(error.kind(), ErrorKind::WouldBlock) {
                 break;
               }
+              println!("failure during handling client: {:?}", error);
             } else {
               println!("failure during handling client: {:?}", error);
             }
@@ -250,7 +252,10 @@ impl AppState {
         let id = Uuid::new_v4();
         self.clients.insert(addr.clone(), id);
         let ip = self.dhcp.new_client(id)?;
-        self.clients_map.remove(&id);
+        if let Some(old) = self.clients_map.remove(&id) {
+          drop(self.dhcp.free(old.vpn_ip));
+        }
+
         let client = self.clients_map.entry(id).or_insert(Client {
           crypter,
           socket_addr: addr,
@@ -275,7 +280,10 @@ impl AppState {
           .clients
           .get(&addr)
           .and_then(|client| self.clients_map.get_mut(client))
-          .ok_or(std::io::Error::new(ErrorKind::NotFound, "Client not found"))?;
+          .ok_or(std::io::Error::new(
+            ErrorKind::NotFound,
+            format!("Client not found: {}", addr),
+          ))?;
         let decrypted = data
           .decrypt(&mut client.crypter)
           .ok_or(std::io::Error::new(
@@ -291,14 +299,17 @@ impl AppState {
         ))?;
         if self.dhcp.is_broadcast(destination) {
           println!("Received broadcast from: {addr}");
+          return Ok(());
         }
-        let recipent = self
-          .clients_map
-          .get_mut(&self.dhcp.get(destination)?)
-          .ok_or(std::io::Error::new(
-            ErrorKind::NotFound,
-            "Recipent not found in pool",
-          ))?;
+        let recipent = self.dhcp.get(destination).and_then(|recipent_id| {
+          self
+            .clients_map
+            .get_mut(&recipent_id)
+            .ok_or(std::io::Error::new(
+              ErrorKind::NotFound,
+              format!("Recipent not found in pool: {destination}"),
+            ))
+        })?;
         let encrypted = decrypted.encrypt(&mut recipent.crypter);
 
         send_unreliable_to(

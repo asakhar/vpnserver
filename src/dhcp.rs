@@ -70,14 +70,14 @@ impl Dhcp {
     self.vacant.push(std::cmp::Reverse(ip));
     Ok(())
   }
-  pub fn get(&self, ip: Ipv4Addr) -> std::io::Result<uuid::Uuid> {
-    let ip = u32::from_be_bytes(ip.octets());
+  pub fn get(&self, ip_addr: Ipv4Addr) -> std::io::Result<uuid::Uuid> {
+    let ip = u32::from_be_bytes(ip_addr.octets());
     Ok(
       self
         .clients
         .get(&ip)
         .copied()
-        .ok_or(std::io::Error::new(ErrorKind::NotFound, "Client not found"))?,
+        .ok_or(std::io::Error::new(ErrorKind::NotFound, format!("Client not found: {ip_addr}")))?,
     )
   }
   pub fn is_broadcast(&self, ip: Ipv4Addr) -> bool {
