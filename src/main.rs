@@ -71,15 +71,12 @@ struct App {
 impl App {
   pub fn new() -> Self {
     let args = Cli::parse();
-    let file = File::open(args.secret_key_file).expect("Failed to open secret key file");
-    let sk: qprov::SecKeyPair =
-      bincode::deserialize_from(file).expect("Failed to read secret keys from file");
-    let file = File::open(args.certificate_chain_file).expect("Failed to open certificate file");
-    let cert: qprov::keys::CertificateChain =
-      bincode::deserialize_from(file).expect("Failed to read certificate from file");
-    let file = File::open(args.ca_cert_file).expect("Failed to open ca certificate file");
-    let ca: qprov::Certificate =
-      bincode::deserialize_from(file).expect("Failed to read ca certificate from file");
+    let sk = qprov::SecKeyPair::from_file(&args.secret_key_file)
+      .expect("Failed to read secret keys from file");
+    let cert = qprov::CertificateChain::from_file(&args.certificate_chain_file)
+      .expect("Failed to read certificate from file");
+    let ca = qprov::Certificate::from_file(&args.ca_cert_file)
+      .expect("Failed to read ca certificate from file");
 
     let mut socket = UdpSocket::bind(args.bind_address).expect("Failed to bind to address");
     let dhcp = Dhcp::default();
@@ -352,7 +349,12 @@ impl AppState {
           ))?;
         if matches!(decrypted, DecryptedMessage::KeepAlive) {
           let encrypted = decrypted.encrypt(&mut client.crypter);
-          return Ok(send_unreliable_to(&self.socket, addr, encrypted, self.buffer.as_mut_slice())?);
+          return Ok(send_unreliable_to(
+            &self.socket,
+            addr,
+            encrypted,
+            self.buffer.as_mut_slice(),
+          )?);
         }
         let DecryptedMessage::IpPacket(data) = decrypted else {
           return Err(Box::new(std::io::Error::new(ErrorKind::InvalidInput, "Invalid input for state registered client")));
