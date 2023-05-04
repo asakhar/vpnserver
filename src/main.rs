@@ -2,8 +2,8 @@
 use clap::Parser;
 use dhcp::Dhcp;
 use qprov::Certificate;
+use vpnmessaging::qprov::keys::FileSerialize;
 use std::collections::HashMap;
-use std::fs::File;
 use std::io::ErrorKind;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::time::Duration;
