@@ -8,6 +8,7 @@ use log::debug;
 
 pub struct Dhcp {
   net_mask_suffix: u8,
+  net_addr: Ipv4Addr,
   vacant: BinaryHeap<std::cmp::Reverse<u32>>,
   clients: HashMap<u32, uuid::Uuid>,
 }
@@ -30,6 +31,7 @@ impl Dhcp {
     vacant.extend(ips.map(std::cmp::Reverse));
     Self {
       vacant,
+      net_addr,
       net_mask_suffix,
       clients: HashMap::new(),
     }
@@ -46,6 +48,10 @@ impl Default for Dhcp {
 }
 
 impl Dhcp {
+  pub fn get_self(&self) -> Ipv4Addr {
+    let ip = u32::from_be_bytes(self.net_addr.octets()) | 0x00000001;
+    Ipv4Addr::from(ip.to_be_bytes())
+  }
   pub fn new_client(&mut self, id: uuid::Uuid) -> std::io::Result<Ipv4Addr> {
     let next_ip = self
       .vacant

@@ -21,7 +21,7 @@ pub mod dhcp;
 pub mod transient_hashmap;
 
 const SOCK: mio::Token = mio::Token(0);
-const _TUN: mio::Token = mio::Token(1);
+const TUN: mio::Token = mio::Token(1);
 
 pub fn certificate_verificator(_parent: &Certificate, _child: &Certificate) -> bool {
   true
@@ -44,21 +44,25 @@ enum PotentianClient {
   },
 }
 
+const BUF_SIZE: usize = 0x10000;
+
 struct AppState {
   ca: qprov::Certificate,
   sk: qprov::SecKeyPair,
   cert: qprov::keys::CertificateChain,
   socket: UdpSocket,
+  tun_sender: mio_tun::TunSender,
   potential: TransientHashMap<SocketAddr, PotentianClient>,
   dhcp: Dhcp,
   clients: TransientHashMap<SocketAddr, Uuid>,
   clients_map: HashMap<Uuid, Client>,
   messages: TransientHashMap<IdPair, MessagePartsCollection>,
   poll: mio::Poll,
-  buffer: Box<[u8; 0xffff]>,
+  buffer: Box<[u8; BUF_SIZE]>,
 }
 
 struct App {
+  tun: mio_tun::Tun,
   events: mio::Events,
   state: AppState,
 }
@@ -78,26 +82,40 @@ impl App {
 
     let mut socket = UdpSocket::bind(args.bind_address).expect("Failed to bind to address");
     let dhcp = Dhcp::default();
+    let mut tun = mio_tun::Tun::new_with_path(
+      "./wintun.dll",
+      "DemoServer",
+      "ExampleServer",
+      dhcp.get_self(),
+      dhcp.get_net_mask_suffix(),
+    )
+    .unwrap();
     let potential = TransientHashMap::new(Duration::from_millis(1000));
     let poll = mio::Poll::new().unwrap();
     let registry = poll.registry();
     registry
       .register(&mut socket, SOCK, mio::Interest::READABLE)
       .expect("Failed to register socket");
+    registry
+      .register(&mut tun, TUN, mio::Interest::READABLE)
+      .expect("Failed to register tun");
     let events = mio::Events::with_capacity(1024);
 
-    let buffer: Box<[u8; 0xffff]> = boxed_array::from_default();
+    let buffer: Box<[u8; BUF_SIZE]> = boxed_array::from_default();
 
     let clients = TransientHashMap::new(Duration::from_secs(60 * 60));
     let clients_map = Default::default();
     let messages = TransientHashMap::new(Duration::from_secs(60 * 60));
+    let tun_sender = tun.sender();
     Self {
       events,
+      tun,
       state: AppState {
         ca,
         sk,
         cert,
         socket,
+        tun_sender,
         dhcp,
         potential,
         poll,
@@ -125,19 +143,24 @@ impl App {
 
     for event in &self.events {
       match event.token() {
-        SOCK if event.is_readable() => loop {
+        SOCK => loop {
           let result = self.state.handle_socket_event();
           if let Err(error) = result {
             if let Some(error) = error.downcast_ref::<std::io::Error>() {
               if matches!(error.kind(), ErrorKind::WouldBlock) {
                 break;
               }
-              println!("failure during handling client: {:?}", error);
-            } else {
-              println!("failure during handling client: {:?}", error);
             }
+            println!("sock error: {:?}", error);
           }
         },
+        TUN => {
+          for packet in self.tun.iter() {
+            if let Err(error) = self.state.handle_tun_event(packet) {
+              println!("tun error: {error}");
+            }
+          }
+        }
         _ => {}
       }
     }
@@ -146,6 +169,27 @@ impl App {
 }
 
 impl AppState {
+  pub fn handle_tun_event(&mut self, packet: Vec<u8>) -> Result<(), Box<dyn std::error::Error>> {
+    let Some((source, destination)) = parse_packet(&packet) else {return Ok(())};
+    if self.dhcp.is_broadcast(destination) {
+      println!("Received broadcast from: {source}");
+      return Ok(());
+    }
+    let Some(recipent) = self
+      .dhcp
+      .get(destination)
+      .ok()
+      .and_then(|recipent_id| self.clients_map.get_mut(&recipent_id))  else {return Ok(());};
+    let encrypted = DecryptedMessage::IpPacket(packet).encrypt(&mut recipent.crypter);
+
+    send_unreliable_to(
+      &mut self.socket,
+      recipent.socket_addr,
+      encrypted,
+      self.buffer.as_mut_slice(),
+    )?;
+    Ok(())
+  }
   pub fn handle_socket_event(&mut self) -> Result<(), Box<dyn std::error::Error>> {
     let (len, addr) = self.socket.recv_from(self.buffer.as_mut_slice())?;
     let message: TransmissionMessage = bincode::deserialize(&self.buffer[..len])?;
@@ -290,34 +334,35 @@ impl AppState {
             ErrorKind::InvalidInput,
             "Failed to decrypt message",
           ))?;
-        let DecryptedMessage::IpPacket(data) = &decrypted else {
+        let DecryptedMessage::IpPacket(data) = decrypted else {
           return Err(Box::new(std::io::Error::new(ErrorKind::InvalidInput, "Invalid input for state registered client")));
         };
-        let destination = parse_packet(data).ok_or(std::io::Error::new(
-          ErrorKind::InvalidInput,
-          "Failed to get recipent from packet",
-        ))?;
-        if self.dhcp.is_broadcast(destination) {
-          println!("Received broadcast from: {addr}");
-          return Ok(());
-        }
-        let recipent = self.dhcp.get(destination).and_then(|recipent_id| {
-          self
-            .clients_map
-            .get_mut(&recipent_id)
-            .ok_or(std::io::Error::new(
-              ErrorKind::NotFound,
-              format!("Recipent not found in pool: {destination}"),
-            ))
-        })?;
-        let encrypted = decrypted.encrypt(&mut recipent.crypter);
+        self.tun_sender.send(data);
+        // let destination = parse_packet(data).ok_or(std::io::Error::new(
+        //   ErrorKind::InvalidInput,
+        //   "Failed to get recipent from packet",
+        // ))?;
+        // if self.dhcp.is_broadcast(destination) {
+        //   println!("Received broadcast from: {addr}");
+        //   return Ok(());
+        // }
+        // let recipent = self.dhcp.get(destination).and_then(|recipent_id| {
+        //   self
+        //     .clients_map
+        //     .get_mut(&recipent_id)
+        //     .ok_or(std::io::Error::new(
+        //       ErrorKind::NotFound,
+        //       format!("Recipent not found in pool: {destination}"),
+        //     ))
+        // })?;
+        // let encrypted = decrypted.encrypt(&mut recipent.crypter);
 
-        send_unreliable_to(
-          &mut self.socket,
-          recipent.socket_addr,
-          encrypted,
-          self.buffer.as_mut_slice(),
-        )?;
+        // send_unreliable_to(
+        //   &mut self.socket,
+        //   recipent.socket_addr,
+        //   encrypted,
+        //   self.buffer.as_mut_slice(),
+        // )?;
       }
     }
     Ok(())
@@ -332,14 +377,17 @@ fn main() {
   }
 }
 
-fn parse_packet(data: &[u8]) -> Option<Ipv4Addr> {
+fn parse_packet(data: &[u8]) -> Option<(Ipv4Addr, Ipv4Addr)> {
   let packet = etherparse::SlicedPacket::from_ip(data).unwrap();
   let ip = packet.ip?;
   match ip {
     etherparse::InternetSlice::Ipv4(header, _exts) => {
       let header = header.to_header();
       // println!("packet header: {header:?}");
-      return Some(Ipv4Addr::from(header.destination));
+      return Some((
+        Ipv4Addr::from(header.source),
+        Ipv4Addr::from(header.destination),
+      ));
     }
     etherparse::InternetSlice::Ipv6(_header, _exts) => {
       // let header = header.to_header();

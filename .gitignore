@@ -2,3 +2,4 @@
 server.*
 ca.*
 Cargo.lock
+wintun.dll
