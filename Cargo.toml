@@ -15,7 +15,6 @@ lazy_static = "1.4.0"
 log = "0.4.17"
 mio-tun = { version = "0.1.0", path = "./mio-tun" }
 openssl = "0.10.48"
-qprov = { version = "0.1.0", path = "./qprov" }
 serde = { version = "1.0.160", features = ["derive"] }
 uuid = { version = "1.3.2", features = ["v4", "serde"] }
 vpnmessaging = { version = "0.1.0", path = "./vpnmessaging" }

@@ -1,9 +1,6 @@
 [submodule "mio-tun"]
 	path = mio-tun
 	url = git@github.com:asakhar/mio-tun.git
-[submodule "qprov"]
-	path = qprov
-	url = git@github.com:asakhar/qprov.git
 [submodule "vpnmessaging"]
 	path = vpnmessaging
 	url = git@github.com:asakhar/vpnmessaging.git
