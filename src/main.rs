@@ -105,7 +105,7 @@ impl App {
       dhcp.get_net_mask_suffix(),
     )
     .unwrap();
-    let connections = TransientHashMap::new(Duration::from_millis(1000));
+    let connections = TransientHashMap::new(Duration::from_secs(60 * 60));
     let poll = mio::Poll::new().unwrap();
     let registry = poll.registry();
     registry
@@ -121,8 +121,8 @@ impl App {
 
     let buffer: Box<[u8; BUF_SIZE]> = boxed_array::from_default();
 
-    let clients = TransientHashMap::new(Duration::from_secs(20));
-    let messages = TransientHashMap::new(Duration::from_secs(20));
+    let clients = TransientHashMap::new(Duration::from_secs(60 * 60));
+    let messages = TransientHashMap::new(Duration::from_secs(60 * 60));
     let tun_sender = tun.sender();
     let unique_token = mio::Token(TUN.0 + 1);
     Self {
@@ -158,11 +158,13 @@ impl App {
       println!("Pruned {}:{}", addr, id);
     }
     for (token, (stream, _)) in self.state.connections.prune() {
-      drop(self
-        .state
-        .poll
-        .registry()
-        .deregister(&mut stream.into_inner()));
+      drop(
+        self
+          .state
+          .poll
+          .registry()
+          .deregister(&mut stream.into_inner()),
+      );
       println!("Pruned potential client {}", token.0);
     }
     self.state.poll.poll(&mut self.events, None).unwrap();
@@ -198,17 +200,19 @@ impl App {
             }
           }
         }
-        token => {
-          let result = self.state.handle_stream_event(token);
+        token => loop {
+          let result = self.state.handle_stream_event(token, event);
           if let Err(error) = result {
-            if let Some(error) = error.downcast_ref::<std::io::Error>() {
-              if matches!(error.kind(), ErrorKind::WouldBlock) {
-                break;
+            if let Some(error) = error.downcast_ref::<Box<bincode::ErrorKind>>() {
+              if let bincode::ErrorKind::Io(error) = error.as_ref() {
+                if matches!(error.kind(), ErrorKind::WouldBlock) {
+                  break;
+                }
               }
             }
             println!("tcp stream error: {:?}", error);
           }
-        }
+        },
       }
     }
     self.events.clear();
@@ -301,13 +305,19 @@ impl AppState {
   pub fn handle_stream_event(
     &mut self,
     token: mio::Token,
+    event: &mio::event::Event,
   ) -> Result<(), Box<dyn std::error::Error>> {
     let Some((stream, potential)) = self.connections.get_mut(&token) else {
       return Ok(());
      };
-    stream.flush()?;
-    let message: HandshakeMessage = bincode::deserialize_from(&mut *stream)?;
-    stream.consume();
+    if event.is_writable() {
+      stream.flush()?;
+    }
+    if !event.is_readable() {
+      return Ok(());
+    }
+    let message = stream.read_sized()?;
+    let message: HandshakeMessage = bincode::deserialize(&message)?;
     match message {
       HandshakeMessage::Hello(client_hello) => {
         let PotentianClient::AwaitHello = potential else {
@@ -394,9 +404,9 @@ impl AppState {
         }
         .encrypt(&mut client.crypter);
         bincode::serialize_into(&mut *stream, &encrypted)?;
+        stream.flush()?;
         let mut stream = self.connections.remove(&token).unwrap().0.into_inner();
         drop(self.poll.registry().deregister(&mut stream));
-        stream.flush()?;
       }
     }
     Ok(())
