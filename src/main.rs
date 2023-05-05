@@ -202,12 +202,20 @@ impl App {
         }
         token => loop {
           let result = self.state.handle_stream_event(token, event);
+          if let Ok(true) = result {
+            break;
+          }
           if let Err(error) = result {
-            if let Some(error) = error.downcast_ref::<Box<bincode::ErrorKind>>() {
-              if let bincode::ErrorKind::Io(error) = error.as_ref() {
-                if matches!(error.kind(), ErrorKind::WouldBlock) {
-                  break;
-                }
+            // if let Some(error) = error.downcast_ref::<Box<bincode::ErrorKind>>() {
+            //   if let bincode::ErrorKind::Io(error) = error.as_ref() {
+            //     if matches!(error.kind(), ErrorKind::WouldBlock) {
+            //       break;
+            //     }
+            //   }
+            // }
+            if let Some(error) = error.downcast_ref::<std::io::Error>() {
+              if matches!(error.kind(), ErrorKind::WouldBlock) {
+                break;
               }
             }
             println!("tcp stream error: {:?}", error);
@@ -215,7 +223,6 @@ impl App {
         },
       }
     }
-    self.events.clear();
   }
 }
 
@@ -289,6 +296,7 @@ impl AppState {
   }
   pub fn handle_tcp_socket_event(&mut self) -> Result<(), Box<dyn std::error::Error>> {
     let (mut stream, addr) = self.tcp_socket.accept()?;
+    stream.set_nodelay(true)?;
     println!("Connection from: {addr}");
     let token = next(&mut self.unique_token);
     self.poll.registry().register(
@@ -306,15 +314,15 @@ impl AppState {
     &mut self,
     token: mio::Token,
     event: &mio::event::Event,
-  ) -> Result<(), Box<dyn std::error::Error>> {
+  ) -> Result<bool, Box<dyn std::error::Error>> {
     let Some((stream, potential)) = self.connections.get_mut(&token) else {
-      return Ok(());
+      return Ok(true);
      };
     if event.is_writable() {
       stream.flush()?;
     }
     if !event.is_readable() {
-      return Ok(());
+      return Ok(true);
     }
     let message = stream.read_sized()?;
     let message: HandshakeMessage = bincode::deserialize(&message)?;
@@ -406,10 +414,11 @@ impl AppState {
         bincode::serialize_into(&mut *stream, &encrypted)?;
         stream.flush()?;
         let mut stream = self.connections.remove(&token).unwrap().0.into_inner();
-        drop(self.poll.registry().deregister(&mut stream));
+        stream.shutdown(std::net::Shutdown::Both).unwrap();
+        self.poll.registry().deregister(&mut stream).unwrap();
       }
     }
-    Ok(())
+    Ok(false)
   }
 }
 
