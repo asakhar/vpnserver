@@ -160,13 +160,7 @@ impl App {
     }
     for (token, (stream, _)) in self.state.connections.prune() {
       let mut stream = stream.into_inner();
-      drop(
-        self
-          .state
-          .poll
-          .registry()
-          .deregister(&mut stream),
-      );
+      drop(self.state.poll.registry().deregister(&mut stream));
       println!("Pruned potential client {}", token.0);
     }
     self.state.poll.poll(&mut self.events, None).unwrap();
@@ -340,9 +334,13 @@ impl AppState {
         let PotentianClient::AwaitPremaster { ref client_chain, client_random, server_random } = *potential else {
           return Err(VpnError::InvalidData);
         };
-        let server_premaster = KeyType::decapsulate(&self.sk, &encapsulated);
-        let (encapsulated, client_premaster) =
-          KeyType::encapsulate(&client_chain.get_target().contents.pub_keys);
+        let Some(server_premaster) = KeyType::decapsulate(&self.sk, &encapsulated) else {
+          return Err(VpnError::InvalidData);
+        };
+        let Some((encapsulated, client_premaster)) =
+          KeyType::encapsulate(&client_chain.get_target().contents.pub_keys) else {
+return Err(VpnError::InvalidData);
+          };
         let message = HandshakeMessage::Premaster(encapsulated);
 
         bincode::serialize_into(&mut *stream, &message)?;
