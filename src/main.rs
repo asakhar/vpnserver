@@ -11,7 +11,8 @@ use vpnmessaging::mio::net::{TcpListener, UdpSocket};
 use vpnmessaging::qprov::keys::FileSerialize;
 use vpnmessaging::qprov::CertificateChain;
 use vpnmessaging::{
-  compare_hashes, iv_from_hello, mio, BufferedTcpStream, DecryptedHandshakeMessage,
+  compare_hashes, iv_from_hello, mio, BufferedTcpStream, DecryptedHandshakeMessage, VpnError,
+  VpnResult,
 };
 use vpnmessaging::{qprov, MessagePart};
 use vpnmessaging::{
@@ -158,12 +159,13 @@ impl App {
       println!("Pruned {}:{}", addr, id);
     }
     for (token, (stream, _)) in self.state.connections.prune() {
+      let mut stream = stream.into_inner();
       drop(
         self
           .state
           .poll
           .registry()
-          .deregister(&mut stream.into_inner()),
+          .deregister(&mut stream),
       );
       println!("Pruned potential client {}", token.0);
     }
@@ -174,10 +176,8 @@ impl App {
         UDP_SOCK => loop {
           let result = self.state.handle_udp_socket_event();
           if let Err(error) = result {
-            if let Some(error) = error.downcast_ref::<std::io::Error>() {
-              if matches!(error.kind(), ErrorKind::WouldBlock) {
-                break;
-              }
+            if matches!(error, VpnError::WouldBlock) {
+              break;
             }
             println!("udp sock error: {:?}", error);
           }
@@ -185,10 +185,8 @@ impl App {
         TCP_SOCK => loop {
           let result = self.state.handle_tcp_socket_event();
           if let Err(error) = result {
-            if let Some(error) = error.downcast_ref::<std::io::Error>() {
-              if matches!(error.kind(), ErrorKind::WouldBlock) {
-                break;
-              }
+            if matches!(error, VpnError::WouldBlock) {
+              break;
             }
             println!("tcp sock error: {:?}", error);
           }
@@ -206,17 +204,8 @@ impl App {
             break;
           }
           if let Err(error) = result {
-            // if let Some(error) = error.downcast_ref::<Box<bincode::ErrorKind>>() {
-            //   if let bincode::ErrorKind::Io(error) = error.as_ref() {
-            //     if matches!(error.kind(), ErrorKind::WouldBlock) {
-            //       break;
-            //     }
-            //   }
-            // }
-            if let Some(error) = error.downcast_ref::<std::io::Error>() {
-              if matches!(error.kind(), ErrorKind::WouldBlock) {
-                break;
-              }
+            if matches!(error, VpnError::WouldBlock) {
+              break;
             }
             println!("tcp stream error: {:?}", error);
           }
@@ -227,7 +216,7 @@ impl App {
 }
 
 impl AppState {
-  pub fn handle_tun_event(&mut self, packet: Vec<u8>) -> Result<(), Box<dyn std::error::Error>> {
+  pub fn handle_tun_event(&mut self, packet: Vec<u8>) -> VpnResult<()> {
     let Some((_, destination)) = parse_packet(&packet) else {return Ok(())};
     if self.dhcp.is_broadcast(destination) {
       return Ok(());
@@ -247,7 +236,7 @@ impl AppState {
     )?;
     Ok(())
   }
-  pub fn handle_udp_socket_event(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+  pub fn handle_udp_socket_event(&mut self) -> VpnResult<()> {
     let (len, addr) = self.udp_socket.recv_from(self.buffer.as_mut_slice())?;
     let part: MessagePart = bincode::deserialize(&self.buffer[..len])?;
     let id = part.id;
@@ -261,7 +250,7 @@ impl AppState {
     };
     drop(self.messages.remove(&IdPair(addr, id)));
     let Some(client) = self.clients.get_mut(&message.get_sender_id()) else {
-      return Err(Box::new(std::io::Error::new(ErrorKind::NotFound, "Client not found")));
+      return Err(VpnError::NotFound);
     };
     match client.socket_addr {
       SocketAddr::V4(socket_addr)
@@ -277,7 +266,7 @@ impl AppState {
       }
     }
     let Some(decrypted) = message.decrypt(&mut client.crypter) else {
-      return Err(Box::new(std::io::Error::new(ErrorKind::InvalidData, "Failed to decrypt")));
+      return Err(VpnError::InvalidData);
     };
     match decrypted {
       DecryptedMessage::IpPacket(packet) => {
@@ -294,7 +283,7 @@ impl AppState {
     }
     Ok(())
   }
-  pub fn handle_tcp_socket_event(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+  pub fn handle_tcp_socket_event(&mut self) -> VpnResult<()> {
     let (mut stream, addr) = self.tcp_socket.accept()?;
     stream.set_nodelay(true)?;
     println!("Connection from: {addr}");
@@ -309,12 +298,11 @@ impl AppState {
       .insert(token, (stream.into(), PotentianClient::AwaitHello));
     Ok(())
   }
-
   pub fn handle_stream_event(
     &mut self,
     token: mio::Token,
     event: &mio::event::Event,
-  ) -> Result<bool, Box<dyn std::error::Error>> {
+  ) -> VpnResult<bool> {
     let Some((stream, potential)) = self.connections.get_mut(&token) else {
       return Ok(true);
      };
@@ -329,14 +317,11 @@ impl AppState {
     match message {
       HandshakeMessage::Hello(client_hello) => {
         let PotentianClient::AwaitHello = potential else {
-          return Err(Box::new(std::io::Error::new(ErrorKind::InvalidInput, "Invalid input for state await hello")));
+          return Err(VpnError::InvalidData);
         };
-        let Some(client_chain) = client_hello.chain() else {return Err(Box::new(std::io::Error::new(ErrorKind::InvalidData, "Failed to parse client's certificate chain")));};
+        let Some(client_chain) = client_hello.chain() else {return Err(VpnError::InvalidData);};
         if !client_chain.verify(&self.ca, certificate_verificator) {
-          return Err(Box::new(std::io::Error::new(
-            ErrorKind::PermissionDenied,
-            "Failed to authorize clients certificate",
-          )));
+          return Err(VpnError::PermissionDenied);
         }
         let server_hello = HelloMessage::from_serialized(self.cert.clone());
         let message = HandshakeMessage::Hello(server_hello.clone());
@@ -353,7 +338,7 @@ impl AppState {
       }
       HandshakeMessage::Premaster(encapsulated) => {
         let PotentianClient::AwaitPremaster { ref client_chain, client_random, server_random } = *potential else {
-          return Err(Box::new(std::io::Error::new(ErrorKind::InvalidInput, "Invalid input for state await premaster")));
+          return Err(VpnError::InvalidData);
         };
         let server_premaster = KeyType::decapsulate(&self.sk, &encapsulated);
         let (encapsulated, client_premaster) =
@@ -373,7 +358,7 @@ impl AppState {
       }
       HandshakeMessage::Ready(data) => {
         let PotentianClient::AwaitReady { server_random, derived_key } = *potential else {
-          return Err(Box::new(std::io::Error::new(ErrorKind::InvalidInput, "Invalid input for state await ready")));
+          return Err(VpnError::InvalidData);
         };
         let mut crypter = ClientCrypter::new(derived_key, iv_from_hello(server_random));
         let data = data.decrypt(&mut crypter).ok_or(std::io::Error::new(
@@ -381,14 +366,11 @@ impl AppState {
           "Failed to decrypt message",
         ))?;
         let DecryptedHandshakeMessage::Ready { hash } = data else {
-          return Err(Box::new(std::io::Error::new(ErrorKind::InvalidInput, "Invalid input for state await ready")));
+          return Err(VpnError::InvalidData);
         };
         let expected_hash = KeyType::zero(); // TODO: compute hash
         if !compare_hashes(expected_hash, hash) {
-          return Err(Box::new(std::io::Error::new(
-            ErrorKind::InvalidInput,
-            "Hashes did not match",
-          )));
+          return Err(VpnError::InvalidData);
         }
 
         let id = loop {
@@ -414,8 +396,9 @@ impl AppState {
         bincode::serialize_into(&mut *stream, &encrypted)?;
         stream.flush()?;
         let mut stream = self.connections.remove(&token).unwrap().0.into_inner();
-        stream.shutdown(std::net::Shutdown::Both).unwrap();
-        self.poll.registry().deregister(&mut stream).unwrap();
+        stream.shutdown(std::net::Shutdown::Both)?;
+        self.poll.registry().deregister(&mut stream)?;
+        return Ok(true);
       }
     }
     Ok(false)
