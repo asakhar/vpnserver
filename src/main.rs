@@ -2,27 +2,29 @@
 use clap::Parser;
 use dhcp::Dhcp;
 use qprov::Certificate;
-use vpnmessaging::qprov::keys::FileSerialize;
-use std::collections::HashMap;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Write};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::time::Duration;
 use transient_hashmap::TransientHashMap;
 use uuid::Uuid;
-use vpnmessaging::mio::net::UdpSocket;
-use vpnmessaging::qprov;
+use vpnmessaging::mio::net::{TcpListener, UdpSocket};
+use vpnmessaging::qprov::keys::FileSerialize;
+use vpnmessaging::qprov::CertificateChain;
 use vpnmessaging::{
-  compare_hashes, iv_from_hello, send_ack_to, send_guaranteed_to, send_unreliable_to,
-  ClientCrypter, DecryptedMessage, HelloMessage, IdPair, KeyType, MessagePartsCollection,
-  PlainMessage, TransmissionMessage,
+  compare_hashes, iv_from_hello, mio, BufferedTcpStream, DecryptedHandshakeMessage,
 };
-use vpnmessaging::{mio, send_fin_to};
+use vpnmessaging::{qprov, MessagePart};
+use vpnmessaging::{
+  send_unreliable_to, ClientCrypter, DecryptedMessage, HandshakeMessage, HelloMessage, IdPair,
+  KeyType, MessagePartsCollection,
+};
 
 pub mod dhcp;
 pub mod transient_hashmap;
 
-const SOCK: mio::Token = mio::Token(0);
-const TUN: mio::Token = mio::Token(1);
+const UDP_SOCK: mio::Token = mio::Token(0);
+const TCP_SOCK: mio::Token = mio::Token(1);
+const TUN: mio::Token = mio::Token(2);
 
 pub fn certificate_verificator(_parent: &Certificate, _child: &Certificate) -> bool {
   true
@@ -35,29 +37,41 @@ struct Client {
 }
 
 enum PotentianClient {
+  AwaitHello,
   AwaitPremaster {
-    client_hello: HelloMessage,
-    server_hello: HelloMessage,
+    client_chain: CertificateChain,
+    client_random: KeyType,
+    server_random: KeyType,
   },
   AwaitReady {
-    server_hello: KeyType,
+    server_random: KeyType,
     derived_key: KeyType,
   },
 }
 
 const BUF_SIZE: usize = 0x10000;
+fn next(current: &mut mio::Token) -> mio::Token {
+  let next = current.0;
+  if next == usize::MAX {
+    current.0 = TUN.0 + 1;
+  } else {
+    current.0 += 1;
+  }
+  mio::Token(next)
+}
 
 struct AppState {
   ca: qprov::Certificate,
   sk: qprov::SecKeyPair,
-  cert: qprov::keys::CertificateChain,
-  socket: UdpSocket,
+  unique_token: mio::Token,
+  cert: Vec<u8>,
+  udp_socket: UdpSocket,
+  tcp_socket: TcpListener,
   tun_sender: mio_tun::TunSender,
-  potential: TransientHashMap<SocketAddr, PotentianClient>,
   dhcp: Dhcp,
-  clients: TransientHashMap<SocketAddr, Uuid>,
-  clients_map: HashMap<Uuid, Client>,
+  clients: TransientHashMap<Uuid, Client>,
   messages: TransientHashMap<IdPair, MessagePartsCollection>,
+  connections: TransientHashMap<mio::Token, (BufferedTcpStream, PotentianClient)>,
   poll: mio::Poll,
   buffer: Box<[u8; BUF_SIZE]>,
 }
@@ -75,10 +89,13 @@ impl App {
       .expect("Failed to read secret keys from file");
     let cert = qprov::CertificateChain::from_file(&args.certificate_chain_file)
       .expect("Failed to read certificate from file");
+    let cert = bincode::serialize(&cert).unwrap();
     let ca = qprov::Certificate::from_file(&args.ca_cert_file)
       .expect("Failed to read ca certificate from file");
 
-    let mut socket = UdpSocket::bind(args.bind_address).expect("Failed to bind to address");
+    let mut udp_socket = UdpSocket::bind(args.udp_bind_address).expect("Failed to bind to address");
+    let mut tcp_socket =
+      TcpListener::bind(args.tcp_bind_address).expect("Failed to bind to address");
     let dhcp = Dhcp::default();
     let mut tun = mio_tun::Tun::new_with_path(
       "./wintun.dll",
@@ -88,12 +105,15 @@ impl App {
       dhcp.get_net_mask_suffix(),
     )
     .unwrap();
-    let potential = TransientHashMap::new(Duration::from_millis(1000));
+    let connections = TransientHashMap::new(Duration::from_millis(1000));
     let poll = mio::Poll::new().unwrap();
     let registry = poll.registry();
     registry
-      .register(&mut socket, SOCK, mio::Interest::READABLE)
-      .expect("Failed to register socket");
+      .register(&mut udp_socket, UDP_SOCK, mio::Interest::READABLE)
+      .expect("Failed to register udp socket");
+    registry
+      .register(&mut tcp_socket, TCP_SOCK, mio::Interest::READABLE)
+      .expect("Failed to register tcp socket");
     registry
       .register(&mut tun, TUN, mio::Interest::READABLE)
       .expect("Failed to register tun");
@@ -102,9 +122,9 @@ impl App {
     let buffer: Box<[u8; BUF_SIZE]> = boxed_array::from_default();
 
     let clients = TransientHashMap::new(Duration::from_secs(20));
-    let clients_map = Default::default();
     let messages = TransientHashMap::new(Duration::from_secs(20));
     let tun_sender = tun.sender();
+    let unique_token = mio::Token(TUN.0 + 1);
     Self {
       events,
       tun,
@@ -112,22 +132,22 @@ impl App {
         ca,
         sk,
         cert,
-        socket,
+        udp_socket,
+        tcp_socket,
         tun_sender,
         dhcp,
-        potential,
+        unique_token,
+        connections,
         poll,
         buffer,
         clients,
-        clients_map,
         messages,
       },
     }
   }
   pub fn run(&mut self) {
-    for (addr, client) in self.state.clients.prune() {
-      println!("Pruned client: {addr}");
-      let client = self.state.clients_map.remove(&client).unwrap();
+    for (id, client) in self.state.clients.prune() {
+      println!("Pruned client: {id} ({})", client.socket_addr);
       self
         .state
         .dhcp
@@ -137,22 +157,38 @@ impl App {
     for (IdPair(addr, id), _) in self.state.messages.prune() {
       println!("Pruned {}:{}", addr, id);
     }
-    for (potential, _) in self.state.potential.prune() {
-      println!("Pruned potential client {}", potential);
+    for (token, (stream, _)) in self.state.connections.prune() {
+      drop(self
+        .state
+        .poll
+        .registry()
+        .deregister(&mut stream.into_inner()));
+      println!("Pruned potential client {}", token.0);
     }
     self.state.poll.poll(&mut self.events, None).unwrap();
 
     for event in &self.events {
       match event.token() {
-        SOCK => loop {
-          let result = self.state.handle_socket_event();
+        UDP_SOCK => loop {
+          let result = self.state.handle_udp_socket_event();
           if let Err(error) = result {
             if let Some(error) = error.downcast_ref::<std::io::Error>() {
               if matches!(error.kind(), ErrorKind::WouldBlock) {
                 break;
               }
             }
-            println!("sock error: {:?}", error);
+            println!("udp sock error: {:?}", error);
+          }
+        },
+        TCP_SOCK => loop {
+          let result = self.state.handle_tcp_socket_event();
+          if let Err(error) = result {
+            if let Some(error) = error.downcast_ref::<std::io::Error>() {
+              if matches!(error.kind(), ErrorKind::WouldBlock) {
+                break;
+              }
+            }
+            println!("tcp sock error: {:?}", error);
           }
         },
         TUN => {
@@ -162,7 +198,17 @@ impl App {
             }
           }
         }
-        _ => {}
+        token => {
+          let result = self.state.handle_stream_event(token);
+          if let Err(error) = result {
+            if let Some(error) = error.downcast_ref::<std::io::Error>() {
+              if matches!(error.kind(), ErrorKind::WouldBlock) {
+                break;
+              }
+            }
+            println!("tcp stream error: {:?}", error);
+          }
+        }
       }
     }
     self.events.clear();
@@ -175,126 +221,148 @@ impl AppState {
     if self.dhcp.is_broadcast(destination) {
       return Ok(());
     }
-    let Some(recipent) = self
+    let Some((recipent_id, recipent)) = self
       .dhcp
       .get(destination)
       .ok()
-      .and_then(|recipent_id| self.clients_map.get_mut(&recipent_id))  else {return Ok(());};
-    let encrypted = DecryptedMessage::IpPacket(packet).encrypt(&mut recipent.crypter);
+      .and_then(|recipent_id| self.clients.get_mut(&recipent_id).map(|recipent| (recipent_id, recipent)))  else {return Ok(());};
+    let encrypted = DecryptedMessage::IpPacket(packet).encrypt(&mut recipent.crypter, recipent_id);
 
     send_unreliable_to(
-      &mut self.socket,
+      &mut self.udp_socket,
       recipent.socket_addr,
       encrypted,
       self.buffer.as_mut_slice(),
     )?;
     Ok(())
   }
-  pub fn handle_socket_event(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-    let (len, addr) = self.socket.recv_from(self.buffer.as_mut_slice())?;
-    let message: TransmissionMessage = bincode::deserialize(&self.buffer[..len])?;
-    let TransmissionMessage::Part(part) = message else {
-      return Ok(());
-    };
+  pub fn handle_udp_socket_event(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+    let (len, addr) = self.udp_socket.recv_from(self.buffer.as_mut_slice())?;
+    let part: MessagePart = bincode::deserialize(&self.buffer[..len])?;
     let id = part.id;
-    let requires_ack = part.requires_ack;
     let messages = self
       .messages
       .entry(IdPair(addr, id))
       .or_insert_with(|| MessagePartsCollection::new(part.total));
     let result_add = messages.add(part)?;
-    if requires_ack {
-      let first_unrecv = messages.first_unreceived();
-      if first_unrecv != 0 {
-        send_ack_to(
-          &mut self.socket,
-          addr,
-          id,
-          first_unrecv - 1,
-          self.buffer.as_mut_slice(),
-        )?;
-      }
-    };
     let Some(message) = result_add else {
       return Ok(());
     };
-    if requires_ack {
-      send_fin_to(&mut self.socket, addr, id, self.buffer.as_mut_slice())?;
-    }
     drop(self.messages.remove(&IdPair(addr, id)));
-    match message {
-      PlainMessage::Hello(client_hello) => {
-        if !client_hello.chain.verify(&self.ca, certificate_verificator) {
-          return Err(Box::new(std::io::Error::new(
-            ErrorKind::InvalidInput,
-            "Failed to authorize clients certificate",
-          )));
+    let Some(client) = self.clients.get_mut(&message.get_sender_id()) else {
+      return Err(Box::new(std::io::Error::new(ErrorKind::NotFound, "Client not found")));
+    };
+    match client.socket_addr {
+      SocketAddr::V4(socket_addr)
+        if socket_addr.ip().is_unspecified() && socket_addr.port() == 0 =>
+      {
+        drop(std::mem::replace(&mut client.socket_addr, addr));
+      }
+      _ => {
+        if addr != client.socket_addr {
+          println!("Client changed address: {} -> {}", client.socket_addr, addr);
+          drop(std::mem::replace(&mut client.socket_addr, addr));
         }
-        let random = KeyType::generate();
-        let server_hello = HelloMessage {
-          chain: self.cert.clone(),
-          random,
-        };
-        let message = PlainMessage::Hello(server_hello.clone());
-        send_guaranteed_to(
-          &mut self.socket,
+      }
+    }
+    let Some(decrypted) = message.decrypt(&mut client.crypter) else {
+      return Err(Box::new(std::io::Error::new(ErrorKind::InvalidData, "Failed to decrypt")));
+    };
+    match decrypted {
+      DecryptedMessage::IpPacket(packet) => {
+        self.tun_sender.send(packet);
+      }
+      DecryptedMessage::KeepAlive => {
+        send_unreliable_to(
+          &mut self.udp_socket,
           addr,
           message,
           self.buffer.as_mut_slice(),
-          Some(Duration::from_millis(2000)),
         )?;
-        let potential = PotentianClient::AwaitPremaster {
-          client_hello,
-          server_hello,
-        };
-        self.potential.insert(addr, potential);
       }
-      PlainMessage::Premaster(encapsulated) => {
-        let potential = self.potential.get_mut(&addr).ok_or(std::io::Error::new(
-          ErrorKind::NotFound,
-          "Potential client not found",
-        ))?;
-        let PotentianClient::AwaitPremaster { client_hello, server_hello } = potential else {
+    }
+    Ok(())
+  }
+  pub fn handle_tcp_socket_event(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+    let (mut stream, addr) = self.tcp_socket.accept()?;
+    println!("Connection from: {addr}");
+    let token = next(&mut self.unique_token);
+    self.poll.registry().register(
+      &mut stream,
+      token,
+      mio::Interest::READABLE | mio::Interest::WRITABLE,
+    )?;
+    self
+      .connections
+      .insert(token, (stream.into(), PotentianClient::AwaitHello));
+    Ok(())
+  }
+
+  pub fn handle_stream_event(
+    &mut self,
+    token: mio::Token,
+  ) -> Result<(), Box<dyn std::error::Error>> {
+    let Some((stream, potential)) = self.connections.get_mut(&token) else {
+      return Ok(());
+     };
+    stream.flush()?;
+    let message: HandshakeMessage = bincode::deserialize_from(&mut *stream)?;
+    stream.consume();
+    match message {
+      HandshakeMessage::Hello(client_hello) => {
+        let PotentianClient::AwaitHello = potential else {
+          return Err(Box::new(std::io::Error::new(ErrorKind::InvalidInput, "Invalid input for state await hello")));
+        };
+        let Some(client_chain) = client_hello.chain() else {return Err(Box::new(std::io::Error::new(ErrorKind::InvalidData, "Failed to parse client's certificate chain")));};
+        if !client_chain.verify(&self.ca, certificate_verificator) {
+          return Err(Box::new(std::io::Error::new(
+            ErrorKind::PermissionDenied,
+            "Failed to authorize clients certificate",
+          )));
+        }
+        let server_hello = HelloMessage::from_serialized(self.cert.clone());
+        let message = HandshakeMessage::Hello(server_hello.clone());
+        bincode::serialize_into(&mut *stream, &message)?;
+        drop(std::mem::replace(
+          potential,
+          PotentianClient::AwaitPremaster {
+            client_chain,
+            client_random: client_hello.random,
+            server_random: server_hello.random,
+          },
+        ));
+        stream.flush()?;
+      }
+      HandshakeMessage::Premaster(encapsulated) => {
+        let PotentianClient::AwaitPremaster { ref client_chain, client_random, server_random } = *potential else {
           return Err(Box::new(std::io::Error::new(ErrorKind::InvalidInput, "Invalid input for state await premaster")));
         };
         let server_premaster = KeyType::decapsulate(&self.sk, &encapsulated);
         let (encapsulated, client_premaster) =
-          KeyType::encapsulate(&client_hello.chain.get_target().contents.pub_keys);
-        let message = PlainMessage::Premaster(encapsulated);
-        send_guaranteed_to(
-          &mut self.socket,
-          addr,
-          message,
-          self.buffer.as_mut_slice(),
-          Some(Duration::from_millis(500)),
-        )?;
+          KeyType::encapsulate(&client_chain.get_target().contents.pub_keys);
+        let message = HandshakeMessage::Premaster(encapsulated);
 
-        let derived_key =
-          client_hello.random ^ server_hello.random ^ server_premaster ^ client_premaster;
-
-        let server_hello = server_hello.random;
+        bincode::serialize_into(&mut *stream, &message)?;
+        let derived_key = client_random ^ server_random ^ server_premaster ^ client_premaster;
         drop(std::mem::replace(
           potential,
           PotentianClient::AwaitReady {
-            server_hello,
+            server_random,
             derived_key,
           },
         ));
+        stream.flush()?;
       }
-      PlainMessage::Ready(data) => {
-        let potential = self.potential.remove(&addr).ok_or(std::io::Error::new(
-          ErrorKind::NotFound,
-          "Potential client not found",
-        ))?;
-        let PotentianClient::AwaitReady { server_hello, derived_key } = potential else {
+      HandshakeMessage::Ready(data) => {
+        let PotentianClient::AwaitReady { server_random, derived_key } = *potential else {
           return Err(Box::new(std::io::Error::new(ErrorKind::InvalidInput, "Invalid input for state await ready")));
         };
-        let mut crypter = ClientCrypter::new(derived_key, iv_from_hello(server_hello));
+        let mut crypter = ClientCrypter::new(derived_key, iv_from_hello(server_random));
         let data = data.decrypt(&mut crypter).ok_or(std::io::Error::new(
           ErrorKind::InvalidInput,
           "Failed to decrypt message",
         ))?;
-        let DecryptedMessage::Ready { hash } = data else {
+        let DecryptedHandshakeMessage::Ready { hash } = data else {
           return Err(Box::new(std::io::Error::new(ErrorKind::InvalidInput, "Invalid input for state await ready")));
         };
         let expected_hash = KeyType::zero(); // TODO: compute hash
@@ -305,61 +373,30 @@ impl AppState {
           )));
         }
 
-        let id = Uuid::new_v4();
-        self.clients.insert(addr.clone(), id);
+        let id = loop {
+          let id = Uuid::new_v4();
+          if !self.clients.contains_key(&id) {
+            break id;
+          }
+        };
         let ip = self.dhcp.new_client(id)?;
-        if let Some(old) = self.clients_map.remove(&id) {
-          drop(self.dhcp.free(old.vpn_ip));
-        }
 
-        let client = self.clients_map.entry(id).or_insert(Client {
+        let client = self.clients.entry(id).or_insert(Client {
           crypter,
-          socket_addr: addr,
+          socket_addr: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
           vpn_ip: ip,
         });
 
-        let encrypted = DecryptedMessage::Welcome {
+        let encrypted = DecryptedHandshakeMessage::Welcome {
+          id,
           ip,
           mask: self.dhcp.get_net_mask_suffix(),
         }
         .encrypt(&mut client.crypter);
-
-        send_guaranteed_to(
-          &mut self.socket,
-          addr,
-          encrypted,
-          self.buffer.as_mut_slice(),
-          Some(Duration::from_millis(500)),
-        )?;
-      }
-      PlainMessage::Encrypted(data) => {
-        let client = self
-          .clients
-          .get(&addr)
-          .and_then(|client| self.clients_map.get_mut(client))
-          .ok_or(std::io::Error::new(
-            ErrorKind::NotFound,
-            format!("Client not found: {}", addr),
-          ))?;
-        let decrypted = data
-          .decrypt(&mut client.crypter)
-          .ok_or(std::io::Error::new(
-            ErrorKind::InvalidInput,
-            "Failed to decrypt message",
-          ))?;
-        if matches!(decrypted, DecryptedMessage::KeepAlive) {
-          let encrypted = decrypted.encrypt(&mut client.crypter);
-          return Ok(send_unreliable_to(
-            &self.socket,
-            addr,
-            encrypted,
-            self.buffer.as_mut_slice(),
-          )?);
-        }
-        let DecryptedMessage::IpPacket(data) = decrypted else {
-          return Err(Box::new(std::io::Error::new(ErrorKind::InvalidInput, "Invalid input for state registered client")));
-        };
-        self.tun_sender.send(data);
+        bincode::serialize_into(&mut *stream, &encrypted)?;
+        let mut stream = self.connections.remove(&token).unwrap().0.into_inner();
+        drop(self.poll.registry().deregister(&mut stream));
+        stream.flush()?;
       }
     }
     Ok(())
@@ -368,7 +405,6 @@ impl AppState {
 
 fn main() {
   let mut app = App::new();
-
   loop {
     app.run();
   }
@@ -392,7 +428,9 @@ fn parse_packet(data: &[u8]) -> Option<(Ipv4Addr, Ipv4Addr)> {
 #[derive(clap::Parser)]
 struct Cli {
   #[arg(short, long, default_value_t = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 9011)))]
-  bind_address: SocketAddr,
+  udp_bind_address: SocketAddr,
+  #[arg(short, long, default_value_t = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 9010)))]
+  tcp_bind_address: SocketAddr,
   #[arg(short, long, default_value_t = ("keys/server.key".to_owned()))]
   secret_key_file: String,
   #[arg(short = 'e', long, default_value_t = ("keys/server.chn".to_owned()))]
