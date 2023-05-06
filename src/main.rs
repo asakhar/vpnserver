@@ -2,7 +2,7 @@
 use clap::Parser;
 use dhcp::Dhcp;
 use qprov::Certificate;
-use std::io::{ErrorKind, Write};
+use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::time::Duration;
 use transient_hashmap::TransientHashMap;
@@ -267,7 +267,6 @@ impl AppState {
         self.tun_sender.send(packet);
       }
       DecryptedMessage::KeepAlive => {
-        println!("received keep alive client: {}", client.socket_addr);
         let encrypted = decrypted.encrypt(&mut client.crypter, message.get_sender_id());
         send_unreliable_to(
           &mut self.udp_socket,
@@ -361,10 +360,7 @@ return Err(VpnError::InvalidData);
           return Err(VpnError::InvalidData);
         };
         let mut crypter = ClientCrypter::new(derived_key, iv_from_hello(server_random));
-        let data = data.decrypt(&mut crypter).ok_or(std::io::Error::new(
-          ErrorKind::InvalidInput,
-          "Failed to decrypt message",
-        ))?;
+        let data = data.decrypt(&mut crypter).ok_or(VpnError::InvalidData)?;
         let DecryptedHandshakeMessage::Ready { hash } = data else {
           return Err(VpnError::InvalidData);
         };
