@@ -198,7 +198,7 @@ impl App {
             break;
           }
           if let Err(error) = result {
-            if matches!(error, VpnError::WouldBlock) {
+            if matches!(error, VpnError::WouldBlock | VpnError::ConnectionReset) {
               break;
             }
             println!("tcp stream error: {:?}", error);
@@ -267,10 +267,12 @@ impl AppState {
         self.tun_sender.send(packet);
       }
       DecryptedMessage::KeepAlive => {
+        println!("received keep alive client: {}", client.socket_addr);
+        let encrypted = decrypted.encrypt(&mut client.crypter, message.get_sender_id());
         send_unreliable_to(
           &mut self.udp_socket,
           addr,
-          message,
+          encrypted,
           self.buffer.as_mut_slice(),
         )?;
       }
