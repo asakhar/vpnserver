@@ -106,24 +106,24 @@ impl App {
       dhcp.get_net_mask_suffix(),
     )
     .unwrap();
-    let connections = TransientHashMap::new(Duration::from_secs(60 * 60));
-    let poll = mio::Poll::new().unwrap();
+  let poll = mio::Poll::new().unwrap();
     let registry = poll.registry();
     registry
-      .register(&mut udp_socket, UDP_SOCK, mio::Interest::READABLE)
-      .expect("Failed to register udp socket");
-    registry
-      .register(&mut tcp_socket, TCP_SOCK, mio::Interest::READABLE)
-      .expect("Failed to register tcp socket");
+    .register(&mut udp_socket, UDP_SOCK, mio::Interest::READABLE)
+    .expect("Failed to register udp socket");
+  registry
+  .register(&mut tcp_socket, TCP_SOCK, mio::Interest::READABLE)
+  .expect("Failed to register tcp socket");
     registry
       .register(&mut tun, TUN, mio::Interest::READABLE)
       .expect("Failed to register tun");
     let events = mio::Events::with_capacity(1024);
-
+    
     let buffer: Box<[u8; BUF_SIZE]> = boxed_array::from_default();
-
-    let clients = TransientHashMap::new(Duration::from_secs(60 * 60));
-    let messages = TransientHashMap::new(Duration::from_secs(60 * 60));
+    
+    let connections = TransientHashMap::new(Duration::from_secs(5));
+    let clients = TransientHashMap::new(Duration::from_secs(60));
+    let messages = TransientHashMap::new(Duration::from_secs(10));
     let tun_sender = tun.sender();
     let unique_token = mio::Token(TUN.0 + 1);
     Self {
@@ -265,6 +265,7 @@ impl AppState {
     match decrypted {
       DecryptedMessage::IpPacket(packet) => {
         self.tun_sender.send(packet);
+        println!("received ip packet");
       }
       DecryptedMessage::KeepAlive => {
         let encrypted = decrypted.encrypt(&mut client.crypter, message.get_sender_id());
