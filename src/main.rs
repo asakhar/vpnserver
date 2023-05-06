@@ -188,6 +188,9 @@ impl App {
         TUN => {
           for packet in self.tun.iter() {
             if let Err(error) = self.state.handle_tun_event(packet) {
+              if matches!(error, VpnError::WouldBlock) {
+                continue;
+              }
               println!("tun error: {error}");
             }
           }
@@ -265,7 +268,6 @@ impl AppState {
     match decrypted {
       DecryptedMessage::IpPacket(packet) => {
         self.tun_sender.send(packet);
-        println!("received ip packet");
       }
       DecryptedMessage::KeepAlive => {
         let encrypted = decrypted.encrypt(&mut client.crypter, message.get_sender_id());
