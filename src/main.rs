@@ -11,7 +11,7 @@ use vpnmessaging::mio::net::{TcpListener, UdpSocket};
 use vpnmessaging::qprov::keys::FileSerialize;
 use vpnmessaging::qprov::CertificateChain;
 use vpnmessaging::{
-  compare_hashes, iv_from_hello, mio, BufferedTcpStream, DecryptedHandshakeMessage, VpnError,
+  iv_from_hello, mio, BufferedTcpStream, DecryptedHandshakeMessage, VpnError,
   VpnResult,
 };
 use vpnmessaging::{qprov, MessagePart};
@@ -367,7 +367,7 @@ return Err(VpnError::InvalidData);
           return Err(VpnError::InvalidData);
         };
         let expected_hash = KeyType::zero(); // TODO: compute hash
-        if !compare_hashes(expected_hash, hash) {
+        if expected_hash != hash {
           return Err(VpnError::InvalidData);
         }
 
