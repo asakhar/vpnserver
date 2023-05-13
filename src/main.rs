@@ -5,7 +5,6 @@ use qprov::Certificate;
 use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::time::Duration;
-use transient_hashmap::TransientHashMap;
 use uuid::Uuid;
 use vpnmessaging::mio::net::{TcpListener, UdpSocket};
 use vpnmessaging::qprov::keys::FileSerialize;
@@ -21,7 +20,7 @@ use vpnmessaging::{
 };
 
 pub mod dhcp;
-pub mod transient_hashmap;
+use vpnmessaging::TransientHashMap;
 
 const UDP_SOCK: mio::Token = mio::Token(0);
 const TCP_SOCK: mio::Token = mio::Token(1);
