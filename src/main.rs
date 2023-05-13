@@ -2,7 +2,7 @@
 use clap::Parser;
 use dhcp::Dhcp;
 use qprov::Certificate;
-use std::io::{ErrorKind, Write};
+use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::time::Duration;
 use transient_hashmap::TransientHashMap;
@@ -106,24 +106,24 @@ impl App {
       dhcp.get_net_mask_suffix(),
     )
     .unwrap();
-    let connections = TransientHashMap::new(Duration::from_secs(60 * 60));
-    let poll = mio::Poll::new().unwrap();
+  let poll = mio::Poll::new().unwrap();
     let registry = poll.registry();
     registry
-      .register(&mut udp_socket, UDP_SOCK, mio::Interest::READABLE)
-      .expect("Failed to register udp socket");
-    registry
-      .register(&mut tcp_socket, TCP_SOCK, mio::Interest::READABLE)
-      .expect("Failed to register tcp socket");
+    .register(&mut udp_socket, UDP_SOCK, mio::Interest::READABLE)
+    .expect("Failed to register udp socket");
+  registry
+  .register(&mut tcp_socket, TCP_SOCK, mio::Interest::READABLE)
+  .expect("Failed to register tcp socket");
     registry
       .register(&mut tun, TUN, mio::Interest::READABLE)
       .expect("Failed to register tun");
     let events = mio::Events::with_capacity(1024);
-
+    
     let buffer: Box<[u8; BUF_SIZE]> = boxed_array::from_default();
-
-    let clients = TransientHashMap::new(Duration::from_secs(60 * 60));
-    let messages = TransientHashMap::new(Duration::from_secs(60 * 60));
+    
+    let connections = TransientHashMap::new(Duration::from_secs(5));
+    let clients = TransientHashMap::new(Duration::from_secs(60));
+    let messages = TransientHashMap::new(Duration::from_secs(10));
     let tun_sender = tun.sender();
     let unique_token = mio::Token(TUN.0 + 1);
     Self {
@@ -188,6 +188,9 @@ impl App {
         TUN => {
           for packet in self.tun.iter() {
             if let Err(error) = self.state.handle_tun_event(packet) {
+              if matches!(error, VpnError::WouldBlock) {
+                continue;
+              }
               println!("tun error: {error}");
             }
           }
@@ -198,7 +201,7 @@ impl App {
             break;
           }
           if let Err(error) = result {
-            if matches!(error, VpnError::WouldBlock) {
+            if matches!(error, VpnError::WouldBlock | VpnError::ConnectionReset) {
               break;
             }
             println!("tcp stream error: {:?}", error);
@@ -267,10 +270,11 @@ impl AppState {
         self.tun_sender.send(packet);
       }
       DecryptedMessage::KeepAlive => {
+        let encrypted = decrypted.encrypt(&mut client.crypter, message.get_sender_id());
         send_unreliable_to(
           &mut self.udp_socket,
           addr,
-          message,
+          encrypted,
           self.buffer.as_mut_slice(),
         )?;
       }
@@ -359,10 +363,7 @@ return Err(VpnError::InvalidData);
           return Err(VpnError::InvalidData);
         };
         let mut crypter = ClientCrypter::new(derived_key, iv_from_hello(server_random));
-        let data = data.decrypt(&mut crypter).ok_or(std::io::Error::new(
-          ErrorKind::InvalidInput,
-          "Failed to decrypt message",
-        ))?;
+        let data = data.decrypt(&mut crypter).ok_or(VpnError::InvalidData)?;
         let DecryptedHandshakeMessage::Ready { hash } = data else {
           return Err(VpnError::InvalidData);
         };
