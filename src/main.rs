@@ -96,6 +96,7 @@ impl App {
     let mut udp_socket = UdpSocket::bind(args.udp_bind_address).expect("Failed to bind to address");
     let mut tcp_socket =
       TcpListener::bind(args.tcp_bind_address).expect("Failed to bind to address");
+    println!("Listening on: {}", args.tcp_bind_address);
     let dhcp = Dhcp::default();
     let mut tun = mio_tun::Tun::new(
       "DemoServer",
