@@ -97,8 +97,7 @@ impl App {
     let mut tcp_socket =
       TcpListener::bind(args.tcp_bind_address).expect("Failed to bind to address");
     let dhcp = Dhcp::default();
-    let mut tun = mio_tun::Tun::new_with_path(
-      "./wintun.dll",
+    let mut tun = mio_tun::Tun::new(
       "DemoServer",
       "ExampleServer",
       dhcp.get_self(),
