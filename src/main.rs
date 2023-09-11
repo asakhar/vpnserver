@@ -10,8 +10,7 @@ use vpnmessaging::mio::net::{TcpListener, UdpSocket};
 use vpnmessaging::qprov::keys::FileSerialize;
 use vpnmessaging::qprov::CertificateChain;
 use vpnmessaging::{
-  iv_from_hello, mio, BufferedTcpStream, DecryptedHandshakeMessage, VpnError,
-  VpnResult,
+  iv_from_hello, mio, BufferedTcpStream, DecryptedHandshakeMessage, VpnError, VpnResult,
 };
 use vpnmessaging::{qprov, MessagePart};
 use vpnmessaging::{
@@ -105,21 +104,25 @@ impl App {
       dhcp.get_net_mask_suffix(),
     )
     .unwrap();
-  let poll = mio::Poll::new().unwrap();
+    let poll = mio::Poll::new().unwrap();
     let registry = poll.registry();
     registry
-    .register(&mut udp_socket, UDP_SOCK, mio::Interest::READABLE)
-    .expect("Failed to register udp socket");
-  registry
-  .register(&mut tcp_socket, TCP_SOCK, mio::Interest::READABLE)
-  .expect("Failed to register tcp socket");
+      .register(&mut udp_socket, UDP_SOCK, mio::Interest::READABLE)
+      .expect("Failed to register udp socket");
     registry
-      .register(&mut tun, TUN, mio::Interest::READABLE)
+      .register(&mut tcp_socket, TCP_SOCK, mio::Interest::READABLE)
+      .expect("Failed to register tcp socket");
+    registry
+      .register(
+        &mut tun,
+        TUN,
+        mio::Interest::READABLE | mio::Interest::WRITABLE,
+      )
       .expect("Failed to register tun");
     let events = mio::Events::with_capacity(1024);
-    
+
     let buffer: Box<[u8; BUF_SIZE]> = boxed_array::from_default();
-    
+
     let connections = TransientHashMap::new(Duration::from_secs(5));
     let clients = TransientHashMap::new(Duration::from_secs(60));
     let messages = TransientHashMap::new(Duration::from_secs(10));
@@ -172,6 +175,9 @@ impl App {
             if matches!(error, VpnError::WouldBlock) {
               break;
             }
+            if matches!(error, VpnError::NotFound) {
+              continue;
+            }
             println!("udp sock error: {:?}", error);
           }
         },
@@ -213,15 +219,20 @@ impl App {
 
 impl AppState {
   pub fn handle_tun_event(&mut self, packet: Vec<u8>) -> VpnResult<()> {
-    let Some((_, destination)) = parse_packet(&packet) else {return Ok(())};
-    if self.dhcp.is_broadcast(destination) {
+    let Some((_, destination)) = parse_packet(&packet) else {
+      return Ok(());
+    };
+    if self.dhcp.is_broadcast(destination) || destination.is_broadcast() {
       return Ok(());
     }
-    let Some((recipent_id, recipent)) = self
-      .dhcp
-      .get(destination)
-      .ok()
-      .and_then(|recipent_id| self.clients.get_mut(&recipent_id).map(|recipent| (recipent_id, recipent)))  else {return Ok(());};
+    let Some((recipent_id, recipent)) = self.dhcp.get(destination).ok().and_then(|recipent_id| {
+      self
+        .clients
+        .get_mut(&recipent_id)
+        .map(|recipent| (recipent_id, recipent))
+    }) else {
+      return Ok(());
+    };
     let encrypted = DecryptedMessage::IpPacket(packet).encrypt(&mut recipent.crypter, recipent_id);
 
     send_unreliable_to(
@@ -252,12 +263,12 @@ impl AppState {
       SocketAddr::V4(socket_addr)
         if socket_addr.ip().is_unspecified() && socket_addr.port() == 0 =>
       {
-        drop(std::mem::replace(&mut client.socket_addr, addr));
+        _ = std::mem::replace(&mut client.socket_addr, addr);
       }
       _ => {
         if addr != client.socket_addr {
           println!("Client changed address: {} -> {}", client.socket_addr, addr);
-          drop(std::mem::replace(&mut client.socket_addr, addr));
+          _ = std::mem::replace(&mut client.socket_addr, addr);
         }
       }
     }
@@ -302,7 +313,7 @@ impl AppState {
   ) -> VpnResult<bool> {
     let Some((stream, potential)) = self.connections.get_mut(&token) else {
       return Ok(true);
-     };
+    };
     if event.is_writable() {
       stream.flush()?;
     }
@@ -316,7 +327,9 @@ impl AppState {
         let PotentianClient::AwaitHello = potential else {
           return Err(VpnError::InvalidData);
         };
-        let Some(client_chain) = client_hello.chain() else {return Err(VpnError::InvalidData);};
+        let Some(client_chain) = client_hello.chain() else {
+          return Err(VpnError::InvalidData);
+        };
         if !client_chain.verify(&self.ca, certificate_verificator) {
           return Err(VpnError::PermissionDenied);
         }
@@ -334,16 +347,22 @@ impl AppState {
         stream.flush()?;
       }
       HandshakeMessage::Premaster(encapsulated) => {
-        let PotentianClient::AwaitPremaster { ref client_chain, client_random, server_random } = *potential else {
+        let PotentianClient::AwaitPremaster {
+          ref client_chain,
+          client_random,
+          server_random,
+        } = *potential
+        else {
           return Err(VpnError::InvalidData);
         };
         let Some(server_premaster) = KeyType::decapsulate(&self.sk, &encapsulated) else {
           return Err(VpnError::InvalidData);
         };
         let Some((encapsulated, client_premaster)) =
-          KeyType::encapsulate(&client_chain.get_target().contents.pub_keys) else {
-return Err(VpnError::InvalidData);
-          };
+          KeyType::encapsulate(&client_chain.get_target().contents.pub_keys)
+        else {
+          return Err(VpnError::InvalidData);
+        };
         let message = HandshakeMessage::Premaster(encapsulated);
 
         bincode::serialize_into(&mut *stream, &message)?;
@@ -358,7 +377,11 @@ return Err(VpnError::InvalidData);
         stream.flush()?;
       }
       HandshakeMessage::Ready(data) => {
-        let PotentianClient::AwaitReady { server_random, derived_key } = *potential else {
+        let PotentianClient::AwaitReady {
+          server_random,
+          derived_key,
+        } = *potential
+        else {
           return Err(VpnError::InvalidData);
         };
         let mut crypter = ClientCrypter::new(derived_key, iv_from_hello(server_random));
